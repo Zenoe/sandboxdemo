@@ -41,6 +41,7 @@ struct SandboxedProcess {
     HANDLE hNamespaceDir= nullptr;       // NT directory object
     std::wstring boxName;
     std::wstring fsRoot;                 // sandbox FS root path
+    std::vector<DWORD> driverPids;        // PIDs registered with SandboxFlt
     bool   valid        = false;
     bool   suspended    = false;
 };

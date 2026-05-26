@@ -14,6 +14,7 @@
 #include <QFrame>
 #include <QScrollBar>
 #include <QDir>
+#include <algorithm>
 
 // ---- Helpers -----------------------------------------------
 static QLabel* makeLabel(const QString& t) {

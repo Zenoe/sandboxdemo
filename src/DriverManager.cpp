@@ -281,6 +281,9 @@ bool DriverManager::addProcess(DWORD pid, const std::wstring& boxName)
     wcsncpy_s(info.BoxName, boxName.c_str(), SANDBOX_MAX_BOX - 1);
     bool ok = sendIoctl(IOCTL_SANDBOX_ADD_PROCESS, &info, sizeof(info),
         nullptr, 0);
+    if (!ok && GetLastError() == ERROR_ALREADY_EXISTS)
+        ok = true;
+
     if (ok) log(L"[Driver] addProcess PID=" + std::to_wstring(pid) +
         L" → box='" + boxName + L"'");
     else    log(L"[Driver] addProcess failed PID=" + std::to_wstring(pid));
@@ -350,7 +353,11 @@ bool DriverManager::sendIoctl(DWORD code,
             code == IOCTL_SANDBOX_REMOVE_PROCESS);
         bool isExistingBox = (code == IOCTL_SANDBOX_ADD_BOX &&
             err == ERROR_ALREADY_EXISTS);
+        bool isExistingPid = (code == IOCTL_SANDBOX_ADD_PROCESS &&
+            err == ERROR_ALREADY_EXISTS);
         if (!(isRemove && err == ERROR_NOT_FOUND) && !isExistingBox) {
+            if (isExistingPid)
+                return ok == TRUE;
             log(L"[Driver] DeviceIoControl 0x" +
                 [code] { std::wostringstream s; s << std::hex << code; return s.str(); }() +
                 L" failed: " + std::to_wstring(err));

@@ -44,6 +44,8 @@ private:
     void appendLog(const QString& msg);
     void addProcessRow(const SandboxedProcess& sp, bool sandboxed);
     void updateDriverStatus();
+    void syncDriverPids(SandboxedProcess& sp);
+    void unregisterDriverPids(SandboxedProcess& sp);
 
     // ---- Driver panel ----
     QLineEdit*   m_sysPath      = nullptr;

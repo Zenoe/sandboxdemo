@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <cassert>
 #include <algorithm>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
@@ -19,6 +20,68 @@ static bool isChromiumFamilyPath(std::wstring path)
     return path.find(L"chrome") != std::wstring::npos ||
         path.find(L"msedge") != std::wstring::npos ||
         path.find(L"brave") != std::wstring::npos;
+}
+
+static std::string utf8FromWide(const std::wstring& text)
+{
+    if (text.empty()) return {};
+
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+        static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+
+    std::string out(static_cast<size_t>(needed), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(),
+        static_cast<int>(text.size()), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+static std::string jsonEscape(const std::string& text)
+{
+    std::string out;
+    out.reserve(text.size());
+    for (char ch : text) {
+        switch (ch) {
+        case '\\': out += "\\\\"; break;
+        case '"':  out += "\\\""; break;
+        case '\b': out += "\\b"; break;
+        case '\f': out += "\\f"; break;
+        case '\n': out += "\\n"; break;
+        case '\r': out += "\\r"; break;
+        case '\t': out += "\\t"; break;
+        default:   out += ch; break;
+        }
+    }
+    return out;
+}
+
+static DWORD makeSandboxPathWritable(const std::wstring& path)
+{
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    DWORD flags = DACL_SECURITY_INFORMATION;
+
+#ifdef LABEL_SECURITY_INFORMATION
+    flags |= LABEL_SECURITY_INFORMATION;
+#endif
+
+    /*
+     * This is a demo sandbox root, not a host-protected directory.  Chrome may
+     * use restricted/low-integrity workers for download writes, so the sandbox
+     * tree must be writable by normal users and carry a low integrity label.
+     */
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        L"D:AI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;BU)(A;OICI;FA;;;WD)"
+        L"S:(ML;OICI;NW;;;LW)",
+        SDDL_REVISION_1,
+        &sd,
+        nullptr)) {
+        return GetLastError();
+    }
+
+    BOOL ok = SetFileSecurityW(path.c_str(), flags, sd);
+    DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+    LocalFree(sd);
+    return err;
 }
 
 // ------------------------------------------------------------
@@ -484,9 +547,47 @@ std::wstring SandboxEngine::prepareFsRoot(const std::wstring& base,
     std::error_code ec;
     fs::create_directories(fs::path(root), ec);
     fs::create_directories(fs::path(root + L"\\drive\\C"), ec);
+    fs::create_directories(fs::path(root + L"\\drive\\Downloads"), ec);
     fs::create_directories(fs::path(root + L"\\drive\\Profile"), ec);
+    fs::create_directories(fs::path(root + L"\\drive\\Profile\\Default"), ec);
     fs::create_directories(fs::path(root + L"\\RegHive"), ec);
     fs::create_directories(fs::path(root + L"\\Profile"), ec);
+
+    for (const auto& dir : {
+        root,
+        root + L"\\drive",
+        root + L"\\drive\\C",
+        root + L"\\drive\\Downloads",
+        root + L"\\drive\\Profile",
+        root + L"\\drive\\Profile\\Default",
+        root + L"\\RegHive",
+        root + L"\\Profile"
+    }) {
+        DWORD aclErr = makeSandboxPathWritable(dir);
+        if (aclErr != ERROR_SUCCESS) {
+            log(L"[!] Failed to relax sandbox ACL for " + dir +
+                L": " + std::to_wstring(aclErr));
+        }
+    }
+
+    {
+        fs::path prefsPath(root + L"\\drive\\Profile\\Default\\Preferences");
+        std::ofstream prefs(prefsPath, std::ios::binary | std::ios::trunc);
+        if (prefs) {
+            std::string downloads = jsonEscape(
+                utf8FromWide(root + L"\\drive\\Downloads"));
+            prefs
+                << "{"
+                << "\"download\":{"
+                << "\"default_directory\":\"" << downloads << "\","
+                << "\"directory_upgrade\":true,"
+                << "\"prompt_for_download\":false"
+                << "},"
+                << "\"safebrowsing\":{\"enabled\":false}"
+                << "}";
+        }
+    }
+
     return root;
 }
 
