@@ -1,0 +1,635 @@
+// ============================================================
+//  MainWindow.cpp  —  Full Qt6 GUI with driver panel
+// ============================================================
+#include "MainWindow.h"
+#include <QApplication>
+#include <QFileDialog>
+#include <QHBoxLayout>
+#include <QVBoxLayout>
+#include <QGridLayout>
+#include <QSplitter>
+#include <QFont>
+#include <QDateTime>
+#include <QTabWidget>
+#include <QFrame>
+#include <QScrollBar>
+#include <QDir>
+
+// ---- Helpers -----------------------------------------------
+static QLabel* makeLabel(const QString& t) {
+    auto* l = new QLabel(t);
+    l->setStyleSheet("color:#8899aa;");
+    return l;
+}
+
+static QLineEdit* makeEdit(const QString& ph, const QFont& f) {
+    auto* e = new QLineEdit;
+    e->setPlaceholderText(ph);
+    e->setFont(f);
+    e->setStyleSheet(
+        "QLineEdit{background:#0e0e16;color:#d8d8e8;"
+        "border:1px solid #2a2a3a;border-radius:3px;padding:3px 6px;}"
+        "QLineEdit:focus{border-color:#0af;}");
+    return e;
+}
+
+static QPushButton* makeBtn(const QString& t, const QString& col,
+                             int minH = 30) {
+    auto* b = new QPushButton(t);
+    b->setMinimumHeight(minH);
+    b->setStyleSheet(QString(
+        "QPushButton{background:%1;color:#fff;border:none;"
+        "border-radius:4px;font-weight:bold;padding:0 14px;}"
+        "QPushButton:hover{background:%1cc;}"
+        "QPushButton:disabled{background:#252535;color:#555;}").arg(col));
+    return b;
+}
+
+static QLabel* makeStatLabel() {
+    auto* l = new QLabel("—");
+    l->setStyleSheet("color:#00cc88;font-weight:bold;font-family:Consolas;");
+    return l;
+}
+
+// ============================================================
+MainWindow::MainWindow(QWidget* parent)
+    : QMainWindow(parent)
+    , m_engine([this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
+    , m_driver([this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
+    , m_monitor(new ProcessMonitor(this))
+    , m_statsTimer(new QTimer(this))
+{
+    setWindowTitle("SandboxFlt Demo  —  Minifilter + Job Object + Namespace Isolation");
+    setMinimumSize(1100, 750);
+
+    // Dark palette
+    QPalette p;
+    p.setColor(QPalette::Window,        QColor(0x13,0x13,0x1c));
+    p.setColor(QPalette::WindowText,    QColor(0xd5,0xd5,0xe5));
+    p.setColor(QPalette::Base,          QColor(0x0c,0x0c,0x14));
+    p.setColor(QPalette::AlternateBase, QColor(0x18,0x18,0x22));
+    p.setColor(QPalette::Text,          QColor(0xcc,0xcc,0xdc));
+    p.setColor(QPalette::Button,        QColor(0x20,0x20,0x2c));
+    p.setColor(QPalette::ButtonText,    QColor(0xe0,0xe0,0xf0));
+    p.setColor(QPalette::Highlight,     QColor(0x00,0xaa,0xff));
+    p.setColor(QPalette::HighlightedText, Qt::white);
+    QApplication::setPalette(p);
+
+    setupUi();
+
+    connect(m_monitor,    &ProcessMonitor::processExited, this, &MainWindow::onProcessExited);
+    connect(m_monitor,    &ProcessMonitor::statusUpdate,  this, &MainWindow::onStatusUpdate);
+    connect(m_statsTimer, &QTimer::timeout,               this, &MainWindow::onStatsTimer);
+    m_statsTimer->start(1500);
+
+    appendLog("=== SandboxFlt Demo ===");
+    appendLog("Step 1: Browse to SandboxFlt.sys → Install → Load");
+    appendLog("Step 2: Browse to an EXE → Launch Sandboxed");
+    appendLog("Step 3: Watch the driver redirect file I/O in the Stats panel");
+    updateDriverStatus();
+}
+
+MainWindow::~MainWindow()
+{
+    m_statsTimer->stop();
+    m_monitor->stopAll();
+    for (auto& sp : m_sandboxProcs) m_engine.release(sp);
+    for (auto& sp : m_normalProcs)  m_engine.release(sp);
+}
+
+// ============================================================
+//  setupUi
+// ============================================================
+void MainWindow::setupUi()
+{
+    QFont mono("Consolas", 9);
+    auto* central     = new QWidget(this);
+    setCentralWidget(central);
+    auto* rootLayout  = new QVBoxLayout(central);
+    rootLayout->setContentsMargins(8,8,8,8);
+    rootLayout->setSpacing(6);
+
+    auto groupStyle = [](const QString& col) {
+        return QString(
+            "QGroupBox{font-weight:bold;color:%1;border:1px solid #252535;"
+            "border-radius:4px;margin-top:8px;padding-top:8px;}"
+            "QGroupBox::title{subcontrol-origin:margin;left:10px;}").arg(col);
+    };
+
+    // ================================================================
+    //  ROW 1 — Driver panel  +  Stats panel
+    // ================================================================
+    auto* row1 = new QHBoxLayout;
+
+    // ---- Driver panel ------------------------------------------
+    auto* drvGroup = new QGroupBox("① Driver  (SandboxFlt.sys)", central);
+    drvGroup->setStyleSheet(groupStyle("#ff9900"));
+    auto* drvGrid  = new QGridLayout(drvGroup);
+    drvGrid->setSpacing(5);
+
+    m_sysPath      = makeEdit("Path to SandboxFlt.sys", mono);
+    m_sysPath->setText(QString::fromStdWString(DriverManager::defaultSysPath()));
+    m_btnBrowseSys = makeBtn("…", "#334", 26); m_btnBrowseSys->setFixedWidth(30);
+    m_btnInstall   = makeBtn("Install", "#5544aa", 28);
+    m_btnLoad      = makeBtn("Load",    "#226622", 28);
+    m_btnUnload    = makeBtn("Unload",  "#882222", 28);
+    m_driverStatus = new QLabel("● Not loaded");
+    m_driverStatus->setStyleSheet("color:#ff4444;font-family:Consolas;font-weight:bold;");
+
+    drvGrid->addWidget(makeLabel(".sys path:"), 0, 0);
+    drvGrid->addWidget(m_sysPath,      0, 1);
+    drvGrid->addWidget(m_btnBrowseSys, 0, 2);
+
+    auto* drvBtnRow = new QHBoxLayout;
+    drvBtnRow->addWidget(m_btnInstall);
+    drvBtnRow->addWidget(m_btnLoad);
+    drvBtnRow->addWidget(m_btnUnload);
+    drvBtnRow->addStretch();
+    drvBtnRow->addWidget(m_driverStatus);
+    drvGrid->addLayout(drvBtnRow, 1, 0, 1, 3);
+
+    // ---- Stats panel -------------------------------------------
+    auto* statsGroup = new QGroupBox("② Live Driver Statistics", central);
+    statsGroup->setStyleSheet(groupStyle("#00bbff"));
+    auto* statsGrid  = new QGridLayout(statsGroup);
+    statsGrid->setSpacing(4);
+
+    m_lblBoxes     = makeStatLabel();
+    m_lblPids      = makeStatLabel();
+    m_lblRedirects = makeStatLabel();
+    m_lblBlocked   = makeStatLabel();
+    m_lblLastPath  = makeStatLabel();
+    m_lblLastPath->setFont(mono);
+    m_lblLastPath->setWordWrap(true);
+
+    statsGrid->addWidget(makeLabel("Boxes:"),     0, 0);
+    statsGrid->addWidget(m_lblBoxes,              0, 1);
+    statsGrid->addWidget(makeLabel("PIDs:"),       0, 2);
+    statsGrid->addWidget(m_lblPids,               0, 3);
+    statsGrid->addWidget(makeLabel("Redirects:"), 1, 0);
+    statsGrid->addWidget(m_lblRedirects,          1, 1);
+    statsGrid->addWidget(makeLabel("Blocked:"),   1, 2);
+    statsGrid->addWidget(m_lblBlocked,            1, 3);
+    statsGrid->addWidget(makeLabel("Last path:"), 2, 0);
+    statsGrid->addWidget(m_lblLastPath,           2, 1, 1, 3);
+
+    row1->addWidget(drvGroup,   3);
+    row1->addWidget(statsGroup, 4);
+    rootLayout->addLayout(row1);
+
+    // ================================================================
+    //  ROW 2 — Launch configuration
+    // ================================================================
+    auto* cfgGroup = new QGroupBox("③ Launch Configuration", central);
+    cfgGroup->setStyleSheet(groupStyle("#00dd77"));
+    auto* cfgGrid  = new QGridLayout(cfgGroup);
+    cfgGrid->setSpacing(5);
+
+    m_exePath   = makeEdit("C:\\Windows\\notepad.exe", mono);
+    m_exePath->setText("C:\\Windows\\notepad.exe");
+    m_boxName   = makeEdit("Box00", mono);
+    m_boxName->setText("Box00");
+    m_fsRoot    = makeEdit("C:\\SandboxDemo", mono);
+    m_fsRoot->setText("C:\\SandboxDemo");
+    m_extraArgs = makeEdit("(optional extra arguments)", mono);
+
+    m_btnBrowse = makeBtn("…", "#334", 26); m_btnBrowse->setFixedWidth(30);
+
+    cfgGrid->addWidget(makeLabel("Executable:"), 0, 0);
+    cfgGrid->addWidget(m_exePath,   0, 1); cfgGrid->addWidget(m_btnBrowse, 0, 2);
+    cfgGrid->addWidget(makeLabel("Box Name:"),   1, 0);
+    cfgGrid->addWidget(m_boxName,   1, 1);
+    cfgGrid->addWidget(makeLabel("FS Root:"),    2, 0);
+    cfgGrid->addWidget(m_fsRoot,    2, 1);
+    cfgGrid->addWidget(makeLabel("Extra Args:"), 3, 0);
+    cfgGrid->addWidget(m_extraArgs, 3, 1);
+
+    // Options row
+    auto* optRow = new QHBoxLayout;
+    m_chkRestrictUI  = new QCheckBox("Restrict UI (Job UILimits)");
+    m_chkKillOnClose = new QCheckBox("Kill-on-Close (Job)");
+    m_chkRestrictUI->setChecked(true);
+    m_chkKillOnClose->setChecked(true);
+    QString cbStyle = "QCheckBox{color:#aab;}"
+                      "QCheckBox::indicator:checked{background:#0af;}";
+    m_chkRestrictUI->setStyleSheet(cbStyle);
+    m_chkKillOnClose->setStyleSheet(cbStyle);
+
+    auto* policyLabel = makeLabel("Write policy:");
+    m_cmbPolicy = new QComboBox;
+    m_cmbPolicy->addItems({"Redirect (copy-on-write)", "Block writes", "Pass-through"});
+    m_cmbPolicy->setStyleSheet(
+        "QComboBox{background:#0e0e16;color:#d8d8e8;border:1px solid #2a2a3a;"
+        "border-radius:3px;padding:2px 6px;}"
+        "QComboBox QAbstractItemView{background:#15151f;color:#ccc;}");
+
+    optRow->addWidget(m_chkRestrictUI);
+    optRow->addWidget(m_chkKillOnClose);
+    optRow->addSpacing(20);
+    optRow->addWidget(policyLabel);
+    optRow->addWidget(m_cmbPolicy);
+    optRow->addStretch();
+    cfgGrid->addLayout(optRow, 4, 0, 1, 3);
+
+    // Launch buttons
+    m_btnNormal    = makeBtn("▶  Launch Normal", "#1a4a88");
+    m_btnSandboxed = makeBtn("⬡  Launch Sandboxed", "#0a6634");
+    m_btnKillSel   = makeBtn("✕  Kill Selected", "#773300");
+    m_btnKillAll   = makeBtn("✕✕ Kill All",      "#550011");
+
+    auto* launchRow = new QHBoxLayout;
+    launchRow->addWidget(m_btnNormal);
+    launchRow->addWidget(m_btnSandboxed);
+    launchRow->addStretch();
+    launchRow->addWidget(m_btnKillSel);
+    launchRow->addWidget(m_btnKillAll);
+    cfgGrid->addLayout(launchRow, 5, 0, 1, 3);
+
+    rootLayout->addWidget(cfgGroup);
+
+    // ================================================================
+    //  ROW 3 — Process list | Log (splitter)
+    // ================================================================
+    auto* splitter = new QSplitter(Qt::Horizontal, central);
+
+    auto* listGroup = new QGroupBox("④ Running Processes", splitter);
+    listGroup->setStyleSheet(groupStyle("#aaaacc"));
+    auto* listLay   = new QVBoxLayout(listGroup);
+    m_processList   = new QListWidget;
+    m_processList->setFont(mono);
+    m_processList->setAlternatingRowColors(true);
+    m_processList->setStyleSheet(
+        "QListWidget{background:#0a0a12;color:#ccc;border:none;}"
+        "QListWidget::item{padding:4px 6px;}"
+        "QListWidget::item:selected{background:#003366;}"
+        "QListWidget::item:alternate{background:#0d0d18;}");
+    listLay->addWidget(m_processList);
+
+    auto* logGroup = new QGroupBox("⑤ Engine Log", splitter);
+    logGroup->setStyleSheet(groupStyle("#aaaacc"));
+    auto* logLay   = new QVBoxLayout(logGroup);
+    m_logView      = new QPlainTextEdit;
+    m_logView->setReadOnly(true);
+    m_logView->setFont(mono);
+    m_logView->setMaximumBlockCount(3000);
+    m_logView->setStyleSheet(
+        "QPlainTextEdit{background:#070710;color:#00cc66;border:none;}");
+    logLay->addWidget(m_logView);
+
+    splitter->addWidget(listGroup);
+    splitter->addWidget(logGroup);
+    splitter->setStretchFactor(0, 2);
+    splitter->setStretchFactor(1, 3);
+    splitter->setStyleSheet("QSplitter::handle{background:#222;width:2px;}");
+    rootLayout->addWidget(splitter, 1);
+
+    // ---- Status bar ----
+    m_statusBar = new QLabel("Ready.");
+    m_statusBar->setFont(mono);
+    m_statusBar->setStyleSheet(
+        "QLabel{color:#666;background:#0a0a12;padding:3px 8px;"
+        "border-top:1px solid #1a1a28;}");
+    rootLayout->addWidget(m_statusBar);
+
+    // ---- Connections ----
+    connect(m_btnBrowseSys, &QPushButton::clicked, this, &MainWindow::onBrowseSys);
+    connect(m_btnInstall,   &QPushButton::clicked, this, &MainWindow::onInstallDriver);
+    connect(m_btnLoad,      &QPushButton::clicked, this, &MainWindow::onLoadDriver);
+    connect(m_btnUnload,    &QPushButton::clicked, this, &MainWindow::onUnloadDriver);
+    connect(m_btnBrowse,    &QPushButton::clicked, this, &MainWindow::onBrowseExe);
+    connect(m_btnNormal,    &QPushButton::clicked, this, &MainWindow::onLaunchNormal);
+    connect(m_btnSandboxed, &QPushButton::clicked, this, &MainWindow::onLaunchSandboxed);
+    connect(m_btnKillSel,   &QPushButton::clicked, this, &MainWindow::onKillSelected);
+    connect(m_btnKillAll,   &QPushButton::clicked, this, &MainWindow::onKillAll);
+    connect(m_cmbPolicy,    QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::onPolicyChanged);
+}
+
+// ============================================================
+//  Driver lifecycle slots
+// ============================================================
+void MainWindow::onBrowseSys()
+{
+    QString p = QFileDialog::getOpenFileName(this, "Select SandboxFlt.sys",
+        QString(), "Kernel Driver (*.sys)");
+    if (!p.isEmpty())
+        m_sysPath->setText(QDir::toNativeSeparators(p));
+}
+
+void MainWindow::onInstallDriver()
+{
+    if (!DriverManager::isElevated()) {
+        appendLog("! Must run as Administrator to install driver.");
+        return;
+    }
+    std::wstring path = m_sysPath->text().toStdWString();
+    appendLog("--- Installing SandboxFlt.sys ---");
+    bool ok = m_driver.install(path);
+    updateDriverStatus();
+    appendLog(ok ? "  Install OK." : "  Install FAILED — check log.");
+}
+
+void MainWindow::onLoadDriver()
+{
+    appendLog("--- Loading SandboxFlt driver ---");
+    bool ok = m_driver.load();
+    if (ok) ok = m_driver.open();
+    updateDriverStatus();
+    appendLog(ok ? "  Driver loaded and control device open."
+                 : "  Load FAILED.");
+}
+
+void MainWindow::onUnloadDriver()
+{
+    appendLog("--- Unloading driver ---");
+    m_driver.unload(false);
+    updateDriverStatus();
+}
+
+void MainWindow::updateDriverStatus()
+{
+    if (m_driver.isLoaded()) {
+        m_driverStatus->setText("● Loaded");
+        m_driverStatus->setStyleSheet(
+            "color:#00dd66;font-family:Consolas;font-weight:bold;");
+    } else if (m_driver.isInstalled()) {
+        m_driverStatus->setText("● Installed (not loaded)");
+        m_driverStatus->setStyleSheet(
+            "color:#ffaa00;font-family:Consolas;font-weight:bold;");
+    } else {
+        m_driverStatus->setText("● Not installed");
+        m_driverStatus->setStyleSheet(
+            "color:#ff4444;font-family:Consolas;font-weight:bold;");
+    }
+}
+
+// ============================================================
+//  Stats timer
+// ============================================================
+void MainWindow::onStatsTimer()
+{
+    if (!m_driver.isLoaded()) return;
+    SANDBOX_STATS st{};
+    if (m_driver.queryStats(st)) {
+        m_lblBoxes->setText(QString::number(st.TotalBoxes));
+        m_lblPids->setText(QString::number(st.TotalTrackedPids));
+        m_lblRedirects->setText(QString::number(st.TotalRedirects));
+        m_lblBlocked->setText(QString::number(st.TotalBlocked));
+        QString lp = QString::fromWCharArray(st.LastRedirectedPath);
+        m_lblLastPath->setText(lp.isEmpty() ? "—" : lp);
+    }
+}
+
+// ============================================================
+//  Launch slots
+// ============================================================
+void MainWindow::onBrowseExe()
+{
+    QString p = QFileDialog::getOpenFileName(this, "Select Executable",
+        "C:\\Windows", "Executables (*.exe);;All (*.*)");
+    if (!p.isEmpty())
+        m_exePath->setText(QDir::toNativeSeparators(p));
+}
+
+void MainWindow::onLaunchNormal()
+{
+    QString exe = m_exePath->text().trimmed();
+    if (exe.isEmpty()) { appendLog("! No executable."); return; }
+    appendLog("--- Launch NORMAL: " + exe + " ---");
+
+    STARTUPINFOW si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::wstring cmd = L"\"" + exe.toStdWString() + L"\"";
+    if (CreateProcessW(nullptr, cmd.data(), nullptr, nullptr,
+                       FALSE, CREATE_NEW_CONSOLE, nullptr, nullptr, &si, &pi)) {
+        SandboxedProcess sp;
+        sp.pid = pi.dwProcessId; sp.hProcess = pi.hProcess;
+        sp.hThread = pi.hThread; sp.boxName = L"(normal)"; sp.valid = true;
+        addProcessRow(sp, false);
+        m_normalProcs.push_back(sp);
+        m_monitor->track(sp, QString("Normal PID %1").arg(sp.pid));
+        appendLog(QString("  PID %1 running (no sandbox)").arg(sp.pid));
+    } else {
+        appendLog(QString("! CreateProcess failed: %1").arg(GetLastError()));
+    }
+}
+
+void MainWindow::onLaunchSandboxed()
+{
+    QString exe = m_exePath->text().trimmed();
+    if (exe.isEmpty()) { appendLog("! No executable."); return; }
+    QString exeLower = exe.toLower();
+    const bool isChromium = exeLower.contains("chrome") ||
+        exeLower.contains("msedge") ||
+        exeLower.contains("brave");
+
+    QString uniqueBox = m_boxName->text().trimmed();
+    if (uniqueBox.isEmpty()) uniqueBox = "Box00";
+
+    // ---- Determine sandbox FS root (volume-relative for driver) ----
+    // fsRoot is a Win32 path like C:\SandboxDemo
+    // We need to pass the driver a volume-relative path:
+    //   \SandboxDemo\Box0\drive
+    // (driver prepends the volume device object path internally)
+    QString fsRoot = m_fsRoot->text().trimmed();
+    if (fsRoot.isEmpty()) fsRoot = "C:\\SandboxDemo";
+    // Strip drive letter  "C:\SandboxDemo" → "\SandboxDemo"
+    QString relRoot = fsRoot;
+    if (relRoot.length() >= 2 && relRoot[1] == ':')
+        relRoot = relRoot.mid(2);
+    relRoot = relRoot.replace('/', '\\');
+    if (!relRoot.startsWith('\\')) relRoot.prepend('\\');
+    QString sandboxVolRelative = relRoot + "\\" + uniqueBox + "\\drive";
+
+    appendLog("--- Launch SANDBOXED box=\"" + uniqueBox + "\" ---");
+
+    // ---- Register box with driver first ----
+    bool driverOk = false;
+    if (m_driver.isLoaded()) {
+        driverOk = m_driver.addBox(uniqueBox.toStdWString(),
+                                    sandboxVolRelative.toStdWString(),
+                                    L"\\");   // intercept entire volume
+        if (driverOk) {
+            // Set policy from combo
+            int pol = m_cmbPolicy->currentIndex();
+            m_driver.setPolicy(uniqueBox.toStdWString(),
+                               (SANDBOX_WRITE_POLICY)pol, true, false);
+        }
+    } else {
+        appendLog("  [!] Driver not loaded — FS redirection via driver DISABLED.");
+        appendLog("      Job Object + namespace isolation still active.");
+    }
+
+    // ---- Launch via SandboxEngine (Job + Namespace) ----
+    SandboxConfig cfg;
+    cfg.boxName        = uniqueBox.toStdWString();
+    cfg.executablePath = exe.toStdWString();
+    cfg.commandLine    = m_extraArgs->text().toStdWString();
+    cfg.fsRootBase     = fsRoot.toStdWString();
+    cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
+    cfg.killOnClose    = m_chkKillOnClose->isChecked();
+    if (isChromium && m_chkRestrictUI->isChecked()) {
+        appendLog("  [Chrome] Job UI limits disabled for Chromium compatibility.");
+        appendLog("  [Chrome] Using --no-sandbox because the outer sandbox owns containment.");
+    }
+
+    SandboxedProcess sp = m_engine.launch(cfg);
+    if (!sp.valid) {
+        appendLog("! Process launch failed.");
+        if (driverOk) m_driver.removeBox(uniqueBox.toStdWString());
+        return;
+    }
+
+    // ---- Tell the driver about the new PID ----
+    if (driverOk) {
+        bool pidOk = m_driver.addProcess(sp.pid, uniqueBox.toStdWString());
+        appendLog(pidOk
+            ? QString("  [Driver] PID %1 registered → box '%2'")
+                .arg(sp.pid).arg(uniqueBox)
+            : QString("  [Driver] addProcess failed for PID %1")
+                .arg(sp.pid));
+        if (!pidOk) {
+            appendLog("! Driver PID registration failed; terminating suspended process.");
+            m_driver.removeBox(uniqueBox.toStdWString());
+            m_engine.release(sp);
+            return;
+        }
+    }
+
+    if (!m_engine.resume(sp)) {
+        appendLog("! Failed to resume sandboxed process.");
+        if (driverOk) {
+            m_driver.removeProcess(sp.pid);
+            m_driver.removeBox(uniqueBox.toStdWString());
+        }
+        m_engine.release(sp);
+        return;
+    }
+
+    appendLog("  Job limits: " +
+        QString::fromStdWString(SandboxEngine::describeJob(sp.hJob)));
+
+    addProcessRow(sp, true);
+    m_sandboxProcs.push_back(sp);
+    m_monitor->track(sp, QString("Sandboxed[%1] PID %2")
+                         .arg(uniqueBox).arg(sp.pid));
+}
+
+void MainWindow::onKillSelected()
+{
+    auto* item = m_processList->currentItem();
+    if (!item) { appendLog("! Nothing selected."); return; }
+    DWORD pid = item->data(Qt::UserRole).toUInt();
+    appendLog(QString("--- Kill PID %1 ---").arg(pid));
+
+    for (auto& sp : m_sandboxProcs) {
+        if (sp.pid == pid && sp.valid) {
+            m_driver.removeProcess(pid);
+            m_driver.removeBox(sp.boxName);
+            m_engine.release(sp);
+            item->setText(item->text() + " [killed]");
+            item->setForeground(QColor(0xff,0x44,0x44));
+            return;
+        }
+    }
+    HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    if (h) { TerminateProcess(h,0); CloseHandle(h); }
+    item->setText(item->text() + " [killed]");
+    item->setForeground(QColor(0xff,0x44,0x44));
+}
+
+void MainWindow::onKillAll()
+{
+    appendLog("--- Kill All ---");
+    m_monitor->stopAll();
+    for (auto& sp : m_sandboxProcs) {
+        if (sp.valid) {
+            m_driver.removeProcess(sp.pid);
+            m_driver.removeBox(sp.boxName);
+            m_engine.release(sp);
+        }
+    }
+    m_sandboxProcs.clear();
+    for (auto& sp : m_normalProcs) {
+        if (sp.hProcess) {
+            TerminateProcess(sp.hProcess, 0);
+            CloseHandle(sp.hProcess);
+            CloseHandle(sp.hThread);
+        }
+    }
+    m_normalProcs.clear();
+    m_processList->clear();
+    appendLog("  All processes terminated, boxes unregistered.");
+}
+
+void MainWindow::onPolicyChanged()
+{
+    // If driver is live and boxes exist, update them all
+    if (!m_driver.isLoaded()) return;
+    int pol = m_cmbPolicy->currentIndex();
+    for (auto& sp : m_sandboxProcs) {
+        if (sp.valid)
+            m_driver.setPolicy(sp.boxName, (SANDBOX_WRITE_POLICY)pol, true, false);
+    }
+}
+
+// ============================================================
+//  Monitor callbacks
+// ============================================================
+void MainWindow::onProcessExited(DWORD pid, const QString& label, DWORD code)
+{
+    appendLog(QString("  [EXIT] %1  code=%2").arg(label).arg(code));
+
+    for (auto& sp : m_sandboxProcs) {
+        if (sp.pid == pid && sp.valid) {
+            m_engine.release(sp);
+            m_driver.removeProcess(pid);
+            m_driver.removeBox(sp.boxName);
+            break;
+        }
+    }
+
+    for (auto& sp : m_normalProcs) {
+        if (sp.pid == pid && sp.valid) {
+            m_engine.release(sp);
+            break;
+        }
+    }
+
+    for (int i = 0; i < m_processList->count(); ++i) {
+        auto* it = m_processList->item(i);
+        if (it && it->data(Qt::UserRole).toUInt() == pid) {
+            it->setText(it->text() + QString(" [exit %1]").arg(code));
+            it->setForeground(QColor(0x77,0x77,0x77));
+        }
+    }
+}
+
+void MainWindow::onStatusUpdate(const QString& s) { m_statusBar->setText(s); }
+
+// ============================================================
+//  Helpers
+// ============================================================
+void MainWindow::appendLog(const QString& msg)
+{
+    QString ts = QDateTime::currentDateTime().toString("hh:mm:ss.zzz");
+    m_logView->appendPlainText("[" + ts + "] " + msg);
+    auto* sb = m_logView->verticalScrollBar();
+    if (sb) sb->setValue(sb->maximum());
+}
+
+void MainWindow::addProcessRow(const SandboxedProcess& sp, bool sandboxed)
+{
+    QString icon = sandboxed ? "⬡" : "▶";
+    QString box  = sandboxed ? QString::fromStdWString(sp.boxName) : "(none)";
+    QString mode = sandboxed ? "Job+NS+Driver" : "Unsandboxed";
+
+    auto* item = new QListWidgetItem(
+        QString("%1  PID %-7  Box: %-14  %2")
+            .arg(icon).arg(sp.pid).arg(box).arg(mode));
+    item->setData(Qt::UserRole, (uint)sp.pid);
+    item->setForeground(sandboxed ? QColor(0x00,0xcc,0x66)
+                                  : QColor(0x55,0xaa,0xff));
+    m_processList->addItem(item);
+    m_processList->scrollToBottom();
+}
