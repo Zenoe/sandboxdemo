@@ -299,6 +299,11 @@ static ULONG Hash_Unicode(_In_ PC_UNICODE_STRING Text, _In_ ULONG Seed)
     return hash;
 }
 
+// 这两个数字是 FNV-1a 哈希算法 中定义的两个核心常量：
+//2166136261u → 偏移基值（offset basis）
+//16777619u → FNV 素数（FNV prime）
+// generate a hash key for searching the cache for a file path
+// 为文件路径生成一个用于缓存查找的哈希键值
 static ULONG Path_WriteCacheKey(
     _In_ PC_UNICODE_STRING OriginalPath,
     _In_ PBOX_ENTRY Box)
@@ -339,6 +344,7 @@ static ULONG Path_ParentCacheKey(_In_ PC_UNICODE_STRING Path)
     return CACHE_EMPTY_KEY;
 }
 
+// check the existence of a key in a fixed-size hash cache table o(1)
 static BOOLEAN Cache_Contains(
     _In_reads_(Size) volatile LONG* Cache,
     _In_ ULONG Size,
@@ -349,6 +355,7 @@ static BOOLEAN Cache_Contains(
     if (Key == CACHE_EMPTY_KEY)
         return FALSE;
 
+	// Key & (Size - 1) is equivalent to Key % Size, but cheaper if Size is a power of 2 (which it is).
     idx = Key & (Size - 1);
     return (BOOLEAN)(Cache[idx] == (LONG)Key);
 }
@@ -835,9 +842,11 @@ SandboxFlt_PreCreate(
      * the name format the file system expects after the volume was already
      * selected, which is volume-relative for ordinary creates.
      */
+    // fullPath: "\Device\HarddiskVolume4\SandboxDemo\Box00\drive\Users\admin"
     status = Path_BuildRedirect(&nameInfo->Name, box,
         &fullPath, &fullPathBuf);
     if (NT_SUCCESS(status)) {
+        //fileObjectPath: ""\SandboxDemo\Box00\drive\Users\admin""
         status = Path_BuildRedirectRelative(&nameInfo->Name, box,
             &fileObjectPath, &fileObjectPathBuf);
     }
@@ -867,18 +876,23 @@ SandboxFlt_PreCreate(
     }
 
     /* ---- Apply the redirect ---- */
+    // RelatedFileObject 通常用于表示相对于某个目录的文件
+    // 设为 NULL 确保路径替换时不会产生相对路径解析问题 避免内核混淆"这个文件相对于什么"
     Data->Iopb->TargetFileObject->RelatedFileObject = NULL;
     status = IoReplaceFileObjectName(Data->Iopb->TargetFileObject,
         fileObjectPath.Buffer, fileObjectPath.Length);
     if (NT_SUCCESS(status)) {
+		// 告诉FltMgr已经修改了 Data 中的内容,ensures that the changes are used when the I/O operation is performed.
         FltSetCallbackDataDirty(Data);
         InterlockedIncrement(&g_Sandbox.TotalRedirects);
+		// Cache the last redirected path for debugging purposes.  We truncate to fit the buffer, but that's fine since it's only for diagnostics and not used in any logic.
         copyLen = min(fullPath.Length,
             (SANDBOX_MAX_PATH - 1) * sizeof(WCHAR));
         RtlCopyMemory(g_Sandbox.LastRedirectedPath,
             fullPath.Buffer, copyLen);
         g_Sandbox.LastRedirectedPath[copyLen / sizeof(WCHAR)] = L'\0';
         if (isWrite)
+			// Cache the write-intent path for redirecting future reads without needing to parse the full path again.
             Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
         DbgPrint("[SandboxFlt] PID=%lu REDIR -> %wZ\n", pid, &fullPath);
     }
@@ -1052,6 +1066,7 @@ DirMerge_OpenSandboxDirectory(
     InitializeObjectAttributes(&oa, &sandboxPath,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
+	// open sandbox directory by kernel privilege, retrieving the handle
     status = FltCreateFileEx(g_Sandbox.FilterHandle,
         FltObjects->Instance,
         &ctx->SandboxHandle,
@@ -1074,11 +1089,13 @@ DirMerge_OpenSandboxDirectory(
         return status;
     }
 
+    // 将自定义数据结构与文件对象关联
     status = FltSetStreamHandleContext(FltObjects->Instance,
         FltObjects->FileObject,
         FLT_SET_CONTEXT_KEEP_IF_EXISTS,
         ctx,
         NULL);
+    // 多线程并发设置同一个 FileObject 上下文 
     if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
         FltReleaseContext(ctx);
         rawCtx = NULL;
