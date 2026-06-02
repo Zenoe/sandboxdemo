@@ -1,5 +1,13 @@
-// ============================================================
+﻿// ============================================================
 //  MainWindow.cpp  —  Full Qt6 GUI with driver panel
+//
+//  Changes vs original:
+//    1. m_explorer added to constructor initialiser list
+//    2. m_explorer.startPipeServer() called in constructor body
+//    3. m_explorer.stopPipeServer() called in destructor
+//    4. onLaunchSandboxed: injectWhileSuspended() called BEFORE resume
+//    5. onFsRootChanged: restarts pipe server when path changes
+//    6. connect(m_fsRoot editingFinished → onFsRootChanged) in setupUi
 // ============================================================
 #include "MainWindow.h"
 #include <QApplication>
@@ -55,8 +63,9 @@ static QLabel* makeStatLabel() {
 // ============================================================
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
-    , m_engine([this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
-    , m_driver([this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
+    , m_engine(  [this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
+    , m_driver(  [this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
+    , m_explorer([this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); }) // ← NEW
     , m_monitor(new ProcessMonitor(this))
     , m_statsTimer(new QTimer(this))
 {
@@ -88,12 +97,21 @@ MainWindow::MainWindow(QWidget* parent)
     appendLog("Step 2: Browse to an EXE → Launch Sandboxed");
     appendLog("Step 3: Watch the driver redirect file I/O in the Stats panel");
     updateDriverStatus();
+
+    // ── NEW: start broker pipe that sandboxed Chrome DLLs write to
+    //         when the user clicks "Show in folder".
+    //         m_fsRoot is populated by setupUi() above so we can read it now.
+    m_explorer.startPipeServer(m_driver, m_engine,
+                               m_fsRoot->text().toStdWString());
+    appendLog("  [Explorer] Named-pipe broker started.");
+    appendLog("  [Explorer] Place SandboxBorder.dll next to this EXE for yellow border.");
 }
 
 MainWindow::~MainWindow()
 {
     m_statsTimer->stop();
     m_monitor->stopAll();
+    m_explorer.stopPipeServer();   // ← NEW: clean up pipe thread
     for (auto& sp : m_sandboxProcs) m_engine.release(sp);
     for (auto& sp : m_normalProcs)  m_engine.release(sp);
 }
@@ -304,6 +322,9 @@ void MainWindow::setupUi()
     connect(m_btnKillAll,   &QPushButton::clicked, this, &MainWindow::onKillAll);
     connect(m_cmbPolicy,    QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onPolicyChanged);
+    // ── NEW: restart pipe server if FS root changes
+    connect(m_fsRoot, &QLineEdit::editingFinished,
+            this, &MainWindow::onFsRootChanged);
 }
 
 // ============================================================
@@ -428,13 +449,8 @@ void MainWindow::onLaunchSandboxed()
     if (uniqueBox.isEmpty()) uniqueBox = "Box00";
 
     // ---- Determine sandbox FS root (volume-relative for driver) ----
-    // fsRoot is a Win32 path like C:\SandboxDemo
-    // We need to pass the driver a volume-relative path:
-    //   \SandboxDemo\Box0\drive
-    // (driver prepends the volume device object path internally)
     QString fsRoot = m_fsRoot->text().trimmed();
     if (fsRoot.isEmpty()) fsRoot = "C:\\SandboxDemo";
-    // Strip drive letter  "C:\SandboxDemo" → "\SandboxDemo"
     QString relRoot = fsRoot;
     if (relRoot.length() >= 2 && relRoot[1] == ':')
         relRoot = relRoot.mid(2);
@@ -449,9 +465,8 @@ void MainWindow::onLaunchSandboxed()
     if (m_driver.isLoaded()) {
         driverOk = m_driver.addBox(uniqueBox.toStdWString(),
                                     sandboxVolRelative.toStdWString(),
-                                    L"\\");   // intercept entire volume
+                                    L"\\");
         if (driverOk) {
-            // Set policy from combo
             int pol = m_cmbPolicy->currentIndex();
             m_driver.setPolicy(uniqueBox.toStdWString(),
                                (SANDBOX_WRITE_POLICY)pol, true, false);
@@ -494,6 +509,24 @@ void MainWindow::onLaunchSandboxed()
             m_driver.removeBox(uniqueBox.toStdWString());
             m_engine.release(sp);
             return;
+        }
+    }
+
+    // ── Inject SandboxBorder.dll BEFORE resume (context hijack).
+    // sp.suspended is still true here — resume() has not been called yet.
+    // Must happen at this exact point: after addProcess() (so the driver
+    // knows the PID) but before ResumeThread (so Job UI restrictions are
+    // not yet enforced and VirtualAllocEx / SetThreadContext work freely).
+    {
+        std::wstring dllPath = SandboxExplorer::defaultDllPath();
+        if (!dllPath.empty()) {
+            bool ok = m_engine.injectWhileSuspended(sp, dllPath);
+            appendLog(ok
+                ? QString("  [Border] Context hijack installed for PID %1").arg(sp.pid)
+                : QString("  [!] Context hijack failed for PID %1 — yellow border skipped").arg(sp.pid));
+        } else {
+            appendLog("  [!] SandboxBorder.dll not found — yellow border skipped.");
+            appendLog("      Build SandboxBorder.dll and place it next to this EXE.");
         }
     }
 
@@ -565,13 +598,21 @@ void MainWindow::onKillAll()
 
 void MainWindow::onPolicyChanged()
 {
-    // If driver is live and boxes exist, update them all
     if (!m_driver.isLoaded()) return;
     int pol = m_cmbPolicy->currentIndex();
     for (auto& sp : m_sandboxProcs) {
         if (sp.valid)
             m_driver.setPolicy(sp.boxName, (SANDBOX_WRITE_POLICY)pol, true, false);
     }
+}
+
+// ── NEW: restart pipe server when the FS root field changes ─────────────────
+void MainWindow::onFsRootChanged()
+{
+    m_explorer.stopPipeServer();
+    m_explorer.startPipeServer(m_driver, m_engine,
+                               m_fsRoot->text().toStdWString());
+    appendLog("  [Explorer] Pipe server restarted: " + m_fsRoot->text());
 }
 
 // ============================================================
@@ -623,7 +664,7 @@ void MainWindow::addProcessRow(const SandboxedProcess& sp, bool sandboxed)
 {
     QString icon = sandboxed ? "⬡" : "▶";
     QString box  = sandboxed ? QString::fromStdWString(sp.boxName) : "(none)";
-    QString mode = sandboxed ? "Job+NS+Driver" : "Unsandboxed";
+    QString mode = sandboxed ? "Job+NS+Driver+Border" : "Unsandboxed";
 
     auto* item = new QListWidgetItem(
         QString("%1  PID %-7  Box: %-14  %2")
