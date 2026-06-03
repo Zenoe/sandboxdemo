@@ -86,6 +86,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "SandboxEngine.h"
+#include "../SandboxBorder/SandboxBorder.h"
 #include <cstring>
 #include <cstdio>
 
@@ -124,6 +125,25 @@ struct Stub64 {
     // call rax
     BYTE call_rax[2]    = { 0xFF, 0xD0 };
 
+    // mov rcx, rax  (HMODULE from LoadLibraryW)
+    BYTE mov_rcx_rax[3] = { 0x48, 0x8B, 0xC8 };
+
+    // mov rdx, <initProcNameAddr>  (imm64)
+    BYTE mov_rdx[2]     = { 0x48, 0xBA };
+    UINT64 initProcNameAddr = 0;
+
+    // mov rax, <GetProcAddress>  (imm64)
+    BYTE mov_rax_gp[2]  = { 0x48, 0xB8 };
+    UINT64 getProcAddr  = 0;
+
+    // call rax
+    BYTE call_rax_gp[2] = { 0xFF, 0xD0 };
+
+    // test rax, rax; je +2; call rax
+    BYTE test_rax[3]    = { 0x48, 0x85, 0xC0 };
+    BYTE je_skip[2]     = { 0x74, 0x02 };
+    BYTE call_init[2]   = { 0xFF, 0xD0 };
+
     // add rsp, 32
     BYTE add_rsp[4]     = { 0x48, 0x83, 0xC4, 0x20 };
 
@@ -154,7 +174,7 @@ struct Stub64 {
 #pragma pack(pop)
 
 // Compile-time size check: update the comment above if this ever changes
-static_assert(sizeof(Stub64) == 78, "Stub64 size changed — update comment");
+static_assert(sizeof(Stub64) == 110, "Stub64 size changed — update comment");
 
 // ============================================================
 bool SandboxEngine::injectWhileSuspended(const SandboxedProcess& sp,
@@ -175,10 +195,14 @@ bool SandboxEngine::injectWhileSuspended(const SandboxedProcess& sp,
 
     UINT64 loadLibAddr = (UINT64)(UINT_PTR)GetProcAddress(hK32, "LoadLibraryW");
     if (!loadLibAddr) { log(L"[Inject] GetProcAddress(LoadLibraryW) failed."); return false; }
+    UINT64 getProcAddr = (UINT64)(UINT_PTR)GetProcAddress(hK32, "GetProcAddress");
+    if (!getProcAddr) { log(L"[Inject] GetProcAddress(GetProcAddress) failed."); return false; }
 
-    // ── 2. Allocate RWX page: [dllPath string][Stub64] ──────────────────
+    // ── 2. Allocate RWX page: [dllPath string][init proc name][Stub64] ──
     SIZE_T pathBytes = (dllPath.size() + 1) * sizeof(wchar_t);
-    SIZE_T totalSize = pathBytes + sizeof(Stub64);
+    const char initProcName[] = SANDBOX_BORDER_INIT_PROC;
+    SIZE_T initProcBytes = sizeof(initProcName);
+    SIZE_T totalSize = pathBytes + initProcBytes + sizeof(Stub64);
 
     LPVOID remBase = VirtualAllocEx(sp.hProcess, nullptr, totalSize,
                                     MEM_COMMIT | MEM_RESERVE,
@@ -189,13 +213,23 @@ bool SandboxEngine::injectWhileSuspended(const SandboxedProcess& sp,
     }
 
     UINT64 remPathAddr = (UINT64)(UINT_PTR)remBase;
-    UINT64 remStubAddr = remPathAddr + (UINT64)pathBytes;
+    UINT64 remInitProcNameAddr = remPathAddr + (UINT64)pathBytes;
+    UINT64 remStubAddr = remInitProcNameAddr + (UINT64)initProcBytes;
 
     // ── 3. Write DLL path ────────────────────────────────────────────────
     SIZE_T written = 0;
     if (!WriteProcessMemory(sp.hProcess, (LPVOID)(UINT_PTR)remPathAddr,
                             dllPath.c_str(), pathBytes, &written)) {
         log(L"[Inject] WriteProcessMemory (path) failed: " +
+            std::to_wstring(GetLastError()));
+        VirtualFreeEx(sp.hProcess, remBase, 0, MEM_RELEASE);
+        return false;
+    }
+
+    if (!WriteProcessMemory(sp.hProcess,
+                            (LPVOID)(UINT_PTR)remInitProcNameAddr,
+                            initProcName, initProcBytes, &written)) {
+        log(L"[Inject] WriteProcessMemory (init proc name) failed: " +
             std::to_wstring(GetLastError()));
         VirtualFreeEx(sp.hProcess, remBase, 0, MEM_RELEASE);
         return false;
@@ -215,6 +249,8 @@ bool SandboxEngine::injectWhileSuspended(const SandboxedProcess& sp,
     Stub64 stub{};
     stub.dllPathAddr = remPathAddr;
     stub.loadLibAddr = loadLibAddr;
+    stub.initProcNameAddr = remInitProcNameAddr;
+    stub.getProcAddr = getProcAddr;
     stub.origRip     = ctx.Rip;
 
     if (!WriteProcessMemory(sp.hProcess, (LPVOID)(UINT_PTR)remStubAddr,

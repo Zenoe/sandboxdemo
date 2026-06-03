@@ -313,12 +313,20 @@ static void CALLBACK WinEventProc(
     {
     case EVENT_OBJECT_LOCATIONCHANGE:
     case EVENT_OBJECT_SHOW:
+    case EVENT_OBJECT_CREATE:
     {
         HWND comp = FindCompanion(hWnd);
         if (comp)
             RepositionCompanion(comp, hWnd);
         else
             AttachToWindow(hWnd); // new window we haven't seen
+        break;
+    }
+
+    case EVENT_OBJECT_NAMECHANGE:
+    {
+        if (IsOurWindow(hWnd))
+            PrefixTitle(hWnd);
         break;
     }
 
@@ -504,24 +512,23 @@ extern "C" SBAPI BOOL WINAPI SandboxBorder_Init(void)
                                    nullptr,              // NULL = in-process
                                    GetCurrentThreadId());
 
-    // 3. Install WinEventHook (in-process, all threads, no DLL injection)
-    //    WINEVENT_INCONTEXT | WINEVENT_SKIPOWNPROCESS would skip our companions;
-    //    use WINEVENT_INCONTEXT alone to track all windows in this process.
+    // 3. Install WinEventHook for this process.  Do not use
+    //    WINEVENT_SKIPOWNTHREAD: in Notepad the target window is created on
+    //    the same initial thread that loaded this DLL.
     g_winEventHook = SetWinEventHook(
-        EVENT_OBJECT_SHOW,        // first event
-        EVENT_OBJECT_REORDER,     // last event (covers LOCATIONCHANGE,HIDE,DESTROY,
-                                  // SHOW, EVENT_SYSTEM_FOREGROUND in this range)
+        EVENT_OBJECT_CREATE,
+        EVENT_OBJECT_NAMECHANGE,
         nullptr,                  // NULL = in-process (WINEVENT_INCONTEXT implied)
         WinEventProc,
         GetCurrentProcessId(),    // this process only
         0,                        // all threads
-        WINEVENT_INCONTEXT | WINEVENT_SKIPOWNTHREAD);
+        WINEVENT_INCONTEXT);
 
     // Also hook foreground/reorder events which have higher IDs
     SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
                     nullptr, WinEventProc,
                     GetCurrentProcessId(), 0,
-                    WINEVENT_INCONTEXT | WINEVENT_SKIPOWNTHREAD);
+                    WINEVENT_INCONTEXT);
 
     // 4. Bootstrap: attach to any windows already open in this process
     EnumWindows(EnumWindowsProc, 0);
@@ -568,8 +575,6 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD reason, LPVOID)
     case DLL_PROCESS_ATTACH:
         g_hModule = hInstance;
         DisableThreadLibraryCalls(hInstance);
-        if (GetEnvironmentVariableW(SANDBOX_BORDER_BOX_ENV, nullptr, 0) > 1)
-            SandboxBorder_Init();
         break;
     case DLL_PROCESS_DETACH:
         SandboxBorder_Uninit();

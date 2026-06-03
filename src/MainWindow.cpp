@@ -60,6 +60,140 @@ static QLabel* makeStatLabel() {
     return l;
 }
 
+// ---- Host-side Sandboxie-style border overlay ----------------
+// This catches UI windows in sandboxed child processes too.  The injected
+// DLL is still useful for in-process hooks, but the host can reliably identify
+// sandbox windows by Job membership.
+static constexpr wchar_t kHostBorderClass[] = L"SandboxDemo_HostBorder";
+static constexpr COLORREF kTransparentKey = RGB(255, 0, 255);
+static constexpr COLORREF kSandboxYellow = RGB(255, 210, 0);
+static constexpr int kBorderThickness = 4;
+
+struct HostBorderEntry {
+    HWND target = nullptr;
+    HWND overlay = nullptr;
+};
+
+static std::vector<HostBorderEntry> g_hostBorders;
+
+static LRESULT CALLBACK HostBorderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+
+        HBRUSH transparent = CreateSolidBrush(kTransparentKey);
+        FillRect(hdc, &rc, transparent);
+        DeleteObject(transparent);
+
+        HBRUSH yellow = CreateSolidBrush(kSandboxYellow);
+        RECT top{ 0, 0, rc.right, kBorderThickness };
+        RECT bottom{ 0, rc.bottom - kBorderThickness, rc.right, rc.bottom };
+        RECT left{ 0, kBorderThickness, kBorderThickness, rc.bottom - kBorderThickness };
+        RECT right{ rc.right - kBorderThickness, kBorderThickness, rc.right, rc.bottom - kBorderThickness };
+        FillRect(hdc, &top, yellow);
+        FillRect(hdc, &bottom, yellow);
+        FillRect(hdc, &left, yellow);
+        FillRect(hdc, &right, yellow);
+        DeleteObject(yellow);
+
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_NCHITTEST:
+        return HTTRANSPARENT;
+    default:
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+}
+
+static void RegisterHostBorderClass()
+{
+    static bool registered = false;
+    if (registered) return;
+
+    WNDCLASSEXW wc{};
+    wc.cbSize = sizeof(wc);
+    wc.lpfnWndProc = HostBorderWndProc;
+    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.lpszClassName = kHostBorderClass;
+    registered = RegisterClassExW(&wc) != 0 ||
+        GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+}
+
+static HWND FindHostBorder(HWND target)
+{
+    for (const auto& entry : g_hostBorders)
+        if (entry.target == target)
+            return entry.overlay;
+    return nullptr;
+}
+
+static void RepositionHostBorder(HWND overlay, HWND target)
+{
+    if (!IsWindow(overlay) || !IsWindow(target)) return;
+
+    if (!IsWindowVisible(target) || IsIconic(target)) {
+        ShowWindow(overlay, SW_HIDE);
+        return;
+    }
+
+    RECT rc{};
+    GetWindowRect(target, &rc);
+    SetWindowPos(overlay, HWND_TOPMOST,
+        rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+        SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(overlay, nullptr, FALSE);
+}
+
+static HWND EnsureHostBorder(HWND target)
+{
+    HWND overlay = FindHostBorder(target);
+    if (overlay) {
+        RepositionHostBorder(overlay, target);
+        return overlay;
+    }
+
+    RegisterHostBorderClass();
+    RECT rc{};
+    GetWindowRect(target, &rc);
+    overlay = CreateWindowExW(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+        WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+        kHostBorderClass,
+        L"",
+        WS_POPUP,
+        rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
+        nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (!overlay)
+        return nullptr;
+
+    SetLayeredWindowAttributes(overlay, kTransparentKey, 0, LWA_COLORKEY);
+    g_hostBorders.push_back({ target, overlay });
+    RepositionHostBorder(overlay, target);
+    return overlay;
+}
+
+static void PrefixHostWindowTitle(HWND hwnd, const std::wstring& boxName)
+{
+    if (!(GetWindowLongW(hwnd, GWL_STYLE) & WS_CAPTION)) return;
+
+    wchar_t title[512]{};
+    GetWindowTextW(hwnd, title, 512);
+    if (wcsncmp(title, L"[Sandbox:", 9) == 0)
+        return;
+
+    wchar_t newTitle[640]{};
+    swprintf_s(newTitle, L"[Sandbox: %s] %s", boxName.c_str(), title);
+    SetWindowTextW(hwnd, newTitle);
+}
+
 // ============================================================
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -112,6 +246,11 @@ MainWindow::~MainWindow()
     m_statsTimer->stop();
     m_monitor->stopAll();
     m_explorer.stopPipeServer();   // ← NEW: clean up pipe thread
+    for (auto& entry : g_hostBorders) {
+        if (IsWindow(entry.overlay))
+            DestroyWindow(entry.overlay);
+    }
+    g_hostBorders.clear();
     for (auto& sp : m_sandboxProcs) m_engine.release(sp);
     for (auto& sp : m_normalProcs)  m_engine.release(sp);
 }
@@ -390,15 +529,18 @@ void MainWindow::updateDriverStatus()
 // ============================================================
 void MainWindow::onStatsTimer()
 {
-    if (!m_driver.isLoaded()) return;
-    SANDBOX_STATS st{};
-    if (m_driver.queryStats(st)) {
-        m_lblBoxes->setText(QString::number(st.TotalBoxes));
-        m_lblPids->setText(QString::number(st.TotalTrackedPids));
-        m_lblRedirects->setText(QString::number(st.TotalRedirects));
-        m_lblBlocked->setText(QString::number(st.TotalBlocked));
-        QString lp = QString::fromWCharArray(st.LastRedirectedPath);
-        m_lblLastPath->setText(lp.isEmpty() ? "—" : lp);
+    updateSandboxWindowBorders();
+
+    if (m_driver.isLoaded()) {
+        SANDBOX_STATS st{};
+        if (m_driver.queryStats(st)) {
+            m_lblBoxes->setText(QString::number(st.TotalBoxes));
+            m_lblPids->setText(QString::number(st.TotalTrackedPids));
+            m_lblRedirects->setText(QString::number(st.TotalRedirects));
+            m_lblBlocked->setText(QString::number(st.TotalBlocked));
+            QString lp = QString::fromWCharArray(st.LastRedirectedPath);
+            m_lblLastPath->setText(lp.isEmpty() ? "—" : lp);
+        }
     }
 }
 
@@ -613,6 +755,83 @@ void MainWindow::onFsRootChanged()
     m_explorer.startPipeServer(m_driver, m_engine,
                                m_fsRoot->text().toStdWString());
     appendLog("  [Explorer] Pipe server restarted: " + m_fsRoot->text());
+}
+
+bool MainWindow::isSandboxWindow(HWND hwnd, std::wstring* boxName) const
+{
+    if (!hwnd || !IsWindow(hwnd)) return false;
+    if (!IsWindowVisible(hwnd) || IsIconic(hwnd)) return false;
+    if (GetAncestor(hwnd, GA_ROOT) != hwnd) return false;
+
+    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if (!(style & WS_CAPTION)) return false;
+    if (exStyle & WS_EX_TOOLWINDOW) return false;
+
+    wchar_t cls[64]{};
+    GetClassNameW(hwnd, cls, 64);
+    if (wcscmp(cls, kHostBorderClass) == 0)
+        return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid == 0 || pid == GetCurrentProcessId())
+        return false;
+
+    HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!proc)
+        return false;
+
+    bool matched = false;
+    for (const auto& sp : m_sandboxProcs) {
+        if (!sp.valid || !sp.hJob)
+            continue;
+
+        BOOL inJob = FALSE;
+        if (IsProcessInJob(proc, sp.hJob, &inJob) && inJob) {
+            if (boxName)
+                *boxName = sp.boxName;
+            matched = true;
+            break;
+        }
+    }
+
+    CloseHandle(proc);
+    return matched;
+}
+
+void MainWindow::updateSandboxWindowBorders()
+{
+    struct EnumCtx {
+        MainWindow* self;
+        std::vector<HWND> seen;
+    } ctx{ this, {} };
+
+    EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+        auto* ctx = reinterpret_cast<EnumCtx*>(lp);
+        std::wstring box;
+        if (ctx->self->isSandboxWindow(hwnd, &box)) {
+            PrefixHostWindowTitle(hwnd, box);
+            EnsureHostBorder(hwnd);
+            ctx->seen.push_back(hwnd);
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    auto it = g_hostBorders.begin();
+    while (it != g_hostBorders.end()) {
+        bool stillSeen = std::find(ctx.seen.begin(), ctx.seen.end(),
+            it->target) != ctx.seen.end();
+        if (!stillSeen || !IsWindow(it->target)) {
+            if (IsWindow(it->overlay))
+                DestroyWindow(it->overlay);
+            it = g_hostBorders.erase(it);
+        }
+        else {
+            RepositionHostBorder(it->overlay, it->target);
+            ++it;
+        }
+    }
 }
 
 // ============================================================

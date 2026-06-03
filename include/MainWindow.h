@@ -52,6 +52,8 @@ private:
     void updateDriverStatus();
     void syncDriverPids(SandboxedProcess& sp);
     void unregisterDriverPids(SandboxedProcess& sp);
+    void updateSandboxWindowBorders();
+    bool isSandboxWindow(HWND hwnd, std::wstring* boxName = nullptr) const;
 
     // ---- Driver panel ----
     QLineEdit*   m_sysPath      = nullptr;
