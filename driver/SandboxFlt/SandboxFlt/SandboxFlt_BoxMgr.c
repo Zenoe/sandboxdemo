@@ -149,17 +149,24 @@ Pid_Find(_In_ HANDLE Pid)
 }
 
 static NTSTATUS
-Pid_AddWithBox(_In_ ULONG Pid, _In_ PBOX_ENTRY Box)
+Pid_AddWithBox(
+    _In_ ULONG Pid,
+    _In_ ULONG ParentPid,
+    _In_ ULONG RootPid,
+    _In_ PBOX_ENTRY Box)
 {
     PPID_ENTRY pe;
 
     if (!Box) return STATUS_INVALID_PARAMETER;
+    if (RootPid == 0) RootPid = Pid;
 
     pe = (PPID_ENTRY)ExAllocatePoolWithTag(
         NonPagedPool, sizeof(PID_ENTRY), SANDBOX_POOL_TAG);
     if (!pe) return STATUS_INSUFFICIENT_RESOURCES;
 
     pe->ProcessId = ULongToHandle(Pid);
+    pe->ParentProcessId = ULongToHandle(ParentPid);
+    pe->RootProcessId = ULongToHandle(RootPid);
     pe->Box = Box;
 
     SbAcquireExclusive(&g_Sandbox.PidLock);
@@ -207,7 +214,7 @@ Pid_Add(_In_ ULONG Pid, _In_ PCWSTR BoxName)
         return STATUS_NOT_FOUND;
     }
 
-    status = Pid_AddWithBox(Pid, box);
+    status = Pid_AddWithBox(Pid, 0, Pid, box);
     if (!NT_SUCCESS(status))
         return status;
 
@@ -216,38 +223,95 @@ Pid_Add(_In_ ULONG Pid, _In_ PCWSTR BoxName)
 }
 
 NTSTATUS
-Pid_AddInherited(_In_ ULONG Pid, _In_ PBOX_ENTRY Box)
+Pid_AddInherited(
+    _In_ ULONG Pid,
+    _In_ ULONG ParentPid,
+    _In_ ULONG RootPid,
+    _In_ PBOX_ENTRY Box)
 {
     NTSTATUS status;
 
-    status = Pid_AddWithBox(Pid, Box);
+    status = Pid_AddWithBox(Pid, ParentPid, RootPid, Box);
     if (NT_SUCCESS(status)) {
-        DbgPrint("[SandboxFlt] Pid_AddInherited: PID %lu -> box '%wZ'\n",
-            Pid, &Box->BoxName);
+        DbgPrint("[SandboxFlt] Pid_AddInherited: PID %lu parent=%lu root=%lu -> box '%wZ'\n",
+            Pid, ParentPid, RootPid, &Box->BoxName);
     }
     return status;
 }
 
 VOID
 SandboxFlt_ProcessNotify(
-    _In_ HANDLE  ParentId,
+    _Inout_  PEPROCESS             Process,
     _In_ HANDLE  ProcessId,
-    _In_ BOOLEAN Create)
+    _In_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo)
 {
     ULONG pid;
+    ULONG parentPid;
+    ULONG rootPid;
     PBOX_ENTRY parentBox;
+    PPID_ENTRY parentEntry;
 
     pid = HandleToULong(ProcessId);
 
-    if (Create) {
-        parentBox = Filter_GetProcContext(HandleToULong(ParentId));
-        if (parentBox)
-            (VOID)Pid_AddInherited(pid, parentBox);
+    if (CreateInfo) {
+        parentPid = HandleToULong(CreateInfo->ParentProcessId);
+        parentBox = Filter_GetProcContext(parentPid);
+        if (parentBox) {
+            rootPid = parentPid;
+            SbAcquireShared(&g_Sandbox.PidLock);
+            parentEntry = Pid_Find(ULongToHandle(parentPid));
+            if (parentEntry && parentEntry->RootProcessId)
+                rootPid = HandleToULong(parentEntry->RootProcessId);
+            SbRelease(&g_Sandbox.PidLock);
+
+            (VOID)Pid_AddInherited(pid, parentPid, rootPid, parentBox);
+        }
     }
     else {
         if (Filter_GetProcContext(pid))
             (VOID)Pid_Remove(pid);
     }
+
+    UNREFERENCED_PARAMETER(Process);
+}
+
+ULONG
+Pid_CopyProcessList(
+    _Out_writes_(MaxEntries) PSANDBOX_PROCESS_ENTRY Entries,
+    _In_ ULONG MaxEntries)
+{
+    PLIST_ENTRY entry;
+    PPID_ENTRY  pe;
+    ULONG       count;
+    ULONG       copyBytes;
+
+    if (!Entries || MaxEntries == 0)
+        return 0;
+
+    count = 0;
+    SbAcquireShared(&g_Sandbox.PidLock);
+    for (entry = g_Sandbox.PidList.Flink;
+        entry != &g_Sandbox.PidList && count < MaxEntries;
+        entry = entry->Flink)
+    {
+        pe = CONTAINING_RECORD(entry, PID_ENTRY, ListEntry);
+        RtlZeroMemory(&Entries[count], sizeof(Entries[count]));
+        Entries[count].ProcessId = HandleToULong(pe->ProcessId);
+        Entries[count].ParentProcessId = HandleToULong(pe->ParentProcessId);
+        Entries[count].RootProcessId = HandleToULong(pe->RootProcessId);
+        if (pe->Box) {
+            copyBytes = pe->Box->BoxName.Length;
+            if (copyBytes > (SANDBOX_MAX_BOX - 1) * sizeof(WCHAR))
+                copyBytes = (SANDBOX_MAX_BOX - 1) * sizeof(WCHAR);
+            RtlCopyMemory(Entries[count].BoxName,
+                pe->Box->BoxName.Buffer,
+                copyBytes);
+            Entries[count].BoxName[copyBytes / sizeof(WCHAR)] = L'\0';
+        }
+        count++;
+    }
+    SbRelease(&g_Sandbox.PidLock);
+    return count;
 }
 
 // ============================================================

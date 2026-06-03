@@ -54,6 +54,8 @@ typedef struct _BOX_ENTRY {
 typedef struct _PID_ENTRY {
     LIST_ENTRY  ListEntry;
     HANDLE      ProcessId;
+    HANDLE      ParentProcessId;
+    HANDLE      RootProcessId;
     PBOX_ENTRY  Box;
 } PID_ENTRY, * PPID_ENTRY;
 
@@ -149,6 +151,21 @@ NTSTATUS Pid_Remove(
 
 PPID_ENTRY Pid_Find(
     _In_ HANDLE Pid);                  /* caller holds PidLock shared */
+
+NTSTATUS Pid_AddInherited(
+    _In_ ULONG      Pid,
+    _In_ ULONG      ParentPid,
+    _In_ ULONG      RootPid,
+    _In_ PBOX_ENTRY Box);
+
+VOID SandboxFlt_ProcessNotify(
+    _Inout_  PEPROCESS             Process,
+    _In_     HANDLE                ProcessId,
+    _In_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
+
+ULONG Pid_CopyProcessList(
+    _Out_writes_(MaxEntries) PSANDBOX_PROCESS_ENTRY Entries,
+    _In_ ULONG MaxEntries);
 
 // Path helpers
 BOOLEAN Path_StartsWith(

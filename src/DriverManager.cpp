@@ -310,6 +310,15 @@ bool DriverManager::queryStats(SANDBOX_STATS& out)
         &bytes) && bytes >= sizeof(SANDBOX_STATS);
 }
 
+bool DriverManager::queryProcesses(SANDBOX_PROCESS_LIST& out)
+{
+    DWORD bytes = 0;
+    return sendIoctl(IOCTL_SANDBOX_QUERY_PROCESSES,
+        nullptr, 0,
+        &out, sizeof(out),
+        &bytes) && bytes >= sizeof(SANDBOX_PROCESS_LIST);
+}
+
 bool DriverManager::setPolicy(const std::wstring& boxName,
     SANDBOX_WRITE_POLICY policy,
     bool redirectReads,

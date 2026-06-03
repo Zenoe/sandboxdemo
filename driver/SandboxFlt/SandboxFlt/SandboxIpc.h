@@ -26,6 +26,7 @@
 #define SANDBOX_MAX_PATH   512
 #define SANDBOX_MAX_BOX    64
 #define SANDBOX_MAX_RULES  32
+#define SANDBOX_MAX_TRACKED_PIDS 256
 
 // ============================================================
 //  IOCTL codes
@@ -50,6 +51,9 @@
 
 #define IOCTL_SANDBOX_SET_POLICY    CTL_CODE(FILE_DEVICE_UNKNOWN, \
     SANDBOX_IOCTL_BASE + 5, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define IOCTL_SANDBOX_QUERY_PROCESSES CTL_CODE(FILE_DEVICE_UNKNOWN, \
+    SANDBOX_IOCTL_BASE + 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // ============================================================
 //  Structures
@@ -91,6 +95,23 @@ typedef struct _SANDBOX_STATS {
     ULONG  _pad;
     WCHAR  LastRedirectedPath[SANDBOX_MAX_PATH];
 } SANDBOX_STATS, * PSANDBOX_STATS;
+
+//
+// Driver-side process tree snapshot. Root launcher PIDs are registered by
+// user mode; child PIDs are inherited through process-create notifications.
+//
+typedef struct _SANDBOX_PROCESS_ENTRY {
+    ULONG  ProcessId;
+    ULONG  ParentProcessId;
+    ULONG  RootProcessId;
+    WCHAR  BoxName[SANDBOX_MAX_BOX];
+} SANDBOX_PROCESS_ENTRY, * PSANDBOX_PROCESS_ENTRY;
+
+typedef struct _SANDBOX_PROCESS_LIST {
+    ULONG                 Count;
+    ULONG                 _pad;
+    SANDBOX_PROCESS_ENTRY Entries[SANDBOX_MAX_TRACKED_PIDS];
+} SANDBOX_PROCESS_LIST, * PSANDBOX_PROCESS_LIST;
 
 //
 // Per-box write policy

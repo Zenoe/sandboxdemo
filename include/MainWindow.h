@@ -7,7 +7,7 @@
 //    • Added onFsRootChanged() slot
 // ============================================================
 #include <QMainWindow>
-#include <QListWidget>
+#include <QTreeWidget>
 #include <QPlainTextEdit>
 #include <QLineEdit>
 #include <QLabel>
@@ -49,6 +49,7 @@ private:
     void setupUi();
     void appendLog(const QString& msg);
     void addProcessRow(const SandboxedProcess& sp, bool sandboxed);
+    void refreshProcessTreeFromDriver(const SANDBOX_PROCESS_LIST& list);
     void updateDriverStatus();
     void syncDriverPids(SandboxedProcess& sp);
     void unregisterDriverPids(SandboxedProcess& sp);
@@ -85,7 +86,7 @@ private:
     QPushButton* m_btnKillAll    = nullptr;
 
     // ---- Process list / log ----
-    QListWidget*    m_processList = nullptr;
+    QTreeWidget*    m_processTree = nullptr;
     QPlainTextEdit* m_logView     = nullptr;
     QLabel*         m_statusBar   = nullptr;
 

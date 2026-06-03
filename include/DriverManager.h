@@ -68,6 +68,7 @@ public:
 
     // Query live statistics from the driver.
     bool queryStats(SANDBOX_STATS& out);
+    bool queryProcesses(SANDBOX_PROCESS_LIST& out);
 
     // Update write policy for a box.
     bool setPolicy(const std::wstring& boxName,

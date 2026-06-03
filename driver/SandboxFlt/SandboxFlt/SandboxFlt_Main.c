@@ -150,9 +150,9 @@ DriverEntry(
         goto Cleanup;
     }
 
-    status = PsSetCreateProcessNotifyRoutine(SandboxFlt_ProcessNotify, FALSE);
+    status = PsSetCreateProcessNotifyRoutineEx(SandboxFlt_ProcessNotify, FALSE);
     if (!NT_SUCCESS(status)) {
-        DbgPrint("[SandboxFlt] PsSetCreateProcessNotifyRoutine failed: %08x\n", status);
+        DbgPrint("[SandboxFlt] PsSetCreateProcessNotifyRoutineEx failed: %08x\n", status);
         FltUnregisterFilter(g_Sandbox.FilterHandle);
         g_Sandbox.FilterHandle = NULL;
         goto Cleanup;
@@ -165,7 +165,7 @@ DriverEntry(
 
 Cleanup:
     if (g_Sandbox.ProcessNotifyRegistered) {
-        PsSetCreateProcessNotifyRoutine(SandboxFlt_ProcessNotify, TRUE);
+        PsSetCreateProcessNotifyRoutineEx(SandboxFlt_ProcessNotify, TRUE);
         g_Sandbox.ProcessNotifyRegistered = FALSE;
     }
     if (g_Sandbox.ControlDevice) {
@@ -192,7 +192,7 @@ SandboxFlt_Unload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     DbgPrint("[SandboxFlt] Unloading\n");
 
     if (g_Sandbox.ProcessNotifyRegistered) {
-        PsSetCreateProcessNotifyRoutine(SandboxFlt_ProcessNotify, TRUE);
+        PsSetCreateProcessNotifyRoutineEx(SandboxFlt_ProcessNotify, TRUE);
         g_Sandbox.ProcessNotifyRegistered = FALSE;
     }
 
@@ -281,6 +281,7 @@ SandboxFlt_DispatchIoctl(
     ULONG_PTR             info;
     PSANDBOX_PROCESS_INFO procInfo;
     PSANDBOX_STATS        st;
+    PSANDBOX_PROCESS_LIST procList;
     PSANDBOX_POLICY_INFO  polInfo;
     UNICODE_STRING        boxName;
     PBOX_ENTRY            box;
@@ -356,6 +357,21 @@ SandboxFlt_DispatchIoctl(
                 g_Sandbox.LastRedirectedPath,
                 sizeof(st->LastRedirectedPath));
             info = sizeof(SANDBOX_STATS);
+            status = STATUS_SUCCESS;
+        }
+        else {
+            status = STATUS_BUFFER_TOO_SMALL;
+        }
+        break;
+
+    case IOCTL_SANDBOX_QUERY_PROCESSES:
+        if (outLen >= sizeof(SANDBOX_PROCESS_LIST)) {
+            procList = (PSANDBOX_PROCESS_LIST)buf;
+            RtlZeroMemory(procList, sizeof(*procList));
+            procList->Count = Pid_CopyProcessList(
+                procList->Entries,
+                SANDBOX_MAX_TRACKED_PIDS);
+            info = sizeof(SANDBOX_PROCESS_LIST);
             status = STATUS_SUCCESS;
         }
         else {

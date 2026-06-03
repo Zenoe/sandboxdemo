@@ -22,7 +22,11 @@
 #include <QFrame>
 #include <QScrollBar>
 #include <QDir>
+#include <QHeaderView>
+#include <QTreeWidgetItemIterator>
 #include <algorithm>
+#include <functional>
+#include <unordered_map>
 
 // ---- Helpers -----------------------------------------------
 static QLabel* makeLabel(const QString& t) {
@@ -413,15 +417,25 @@ void MainWindow::setupUi()
     auto* listGroup = new QGroupBox("④ Running Processes", splitter);
     listGroup->setStyleSheet(groupStyle("#aaaacc"));
     auto* listLay   = new QVBoxLayout(listGroup);
-    m_processList   = new QListWidget;
-    m_processList->setFont(mono);
-    m_processList->setAlternatingRowColors(true);
-    m_processList->setStyleSheet(
-        "QListWidget{background:#0a0a12;color:#ccc;border:none;}"
-        "QListWidget::item{padding:4px 6px;}"
-        "QListWidget::item:selected{background:#003366;}"
-        "QListWidget::item:alternate{background:#0d0d18;}");
-    listLay->addWidget(m_processList);
+    m_processTree   = new QTreeWidget;
+    m_processTree->setFont(mono);
+    m_processTree->setColumnCount(5);
+    m_processTree->setHeaderLabels({ "PID", "Box", "Parent", "Root", "Mode" });
+    m_processTree->setAlternatingRowColors(true);
+    m_processTree->setRootIsDecorated(true);
+    m_processTree->setUniformRowHeights(true);
+    m_processTree->header()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    m_processTree->header()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    m_processTree->header()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    m_processTree->header()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
+    m_processTree->header()->setSectionResizeMode(4, QHeaderView::Stretch);
+    m_processTree->setStyleSheet(
+        "QTreeWidget{background:#0a0a12;color:#ccc;border:none;}"
+        "QTreeWidget::item{padding:3px 6px;}"
+        "QTreeWidget::item:selected{background:#003366;}"
+        "QTreeWidget::item:alternate{background:#0d0d18;}"
+        "QHeaderView::section{background:#10101a;color:#9aa;border:none;padding:4px 6px;}");
+    listLay->addWidget(m_processTree);
 
     auto* logGroup = new QGroupBox("⑤ Engine Log", splitter);
     logGroup->setStyleSheet(groupStyle("#aaaacc"));
@@ -541,6 +555,10 @@ void MainWindow::onStatsTimer()
             QString lp = QString::fromWCharArray(st.LastRedirectedPath);
             m_lblLastPath->setText(lp.isEmpty() ? "—" : lp);
         }
+
+        SANDBOX_PROCESS_LIST processes{};
+        if (m_driver.queryProcesses(processes))
+            refreshProcessTreeFromDriver(processes);
     }
 }
 
@@ -685,7 +703,16 @@ void MainWindow::onLaunchSandboxed()
     appendLog("  Job limits: " +
         QString::fromStdWString(SandboxEngine::describeJob(sp.hJob)));
 
-    addProcessRow(sp, true);
+    if (driverOk) {
+        SANDBOX_PROCESS_LIST processes{};
+        if (m_driver.queryProcesses(processes))
+            refreshProcessTreeFromDriver(processes);
+        else
+            addProcessRow(sp, true);
+    }
+    else {
+        addProcessRow(sp, true);
+    }
     m_sandboxProcs.push_back(sp);
     m_monitor->track(sp, QString("Sandboxed[%1] PID %2")
                          .arg(uniqueBox).arg(sp.pid));
@@ -693,9 +720,10 @@ void MainWindow::onLaunchSandboxed()
 
 void MainWindow::onKillSelected()
 {
-    auto* item = m_processList->currentItem();
+    auto* item = m_processTree->currentItem();
     if (!item) { appendLog("! Nothing selected."); return; }
-    DWORD pid = item->data(Qt::UserRole).toUInt();
+    DWORD pid = item->data(0, Qt::UserRole).toUInt();
+    bool sandboxed = item->data(0, Qt::UserRole + 1).toBool();
     appendLog(QString("--- Kill PID %1 ---").arg(pid));
 
     for (auto& sp : m_sandboxProcs) {
@@ -703,15 +731,19 @@ void MainWindow::onKillSelected()
             m_driver.removeProcess(pid);
             m_driver.removeBox(sp.boxName);
             m_engine.release(sp);
-            item->setText(item->text() + " [killed]");
-            item->setForeground(QColor(0xff,0x44,0x44));
+            item->setText(4, item->text(4) + " [killed]");
+            for (int c = 0; c < m_processTree->columnCount(); ++c)
+                item->setForeground(c, QColor(0xff,0x44,0x44));
             return;
         }
     }
     HANDLE h = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
     if (h) { TerminateProcess(h,0); CloseHandle(h); }
-    item->setText(item->text() + " [killed]");
-    item->setForeground(QColor(0xff,0x44,0x44));
+    if (sandboxed)
+        m_driver.removeProcess(pid);
+    item->setText(4, item->text(4) + " [killed]");
+    for (int c = 0; c < m_processTree->columnCount(); ++c)
+        item->setForeground(c, QColor(0xff,0x44,0x44));
 }
 
 void MainWindow::onKillAll()
@@ -734,7 +766,7 @@ void MainWindow::onKillAll()
         }
     }
     m_normalProcs.clear();
-    m_processList->clear();
+    m_processTree->clear();
     appendLog("  All processes terminated, boxes unregistered.");
 }
 
@@ -857,12 +889,15 @@ void MainWindow::onProcessExited(DWORD pid, const QString& label, DWORD code)
         }
     }
 
-    for (int i = 0; i < m_processList->count(); ++i) {
-        auto* it = m_processList->item(i);
-        if (it && it->data(Qt::UserRole).toUInt() == pid) {
-            it->setText(it->text() + QString(" [exit %1]").arg(code));
-            it->setForeground(QColor(0x77,0x77,0x77));
+    QTreeWidgetItemIterator it(m_processTree);
+    while (*it) {
+        auto* row = *it;
+        if (row->data(0, Qt::UserRole).toUInt() == pid) {
+            row->setText(4, row->text(4) + QString(" [exit %1]").arg(code));
+            for (int c = 0; c < m_processTree->columnCount(); ++c)
+                row->setForeground(c, QColor(0x77,0x77,0x77));
         }
+        ++it;
     }
 }
 
@@ -883,14 +918,89 @@ void MainWindow::addProcessRow(const SandboxedProcess& sp, bool sandboxed)
 {
     QString icon = sandboxed ? "⬡" : "▶";
     QString box  = sandboxed ? QString::fromStdWString(sp.boxName) : "(none)";
-    QString mode = sandboxed ? "Job+NS+Driver+Border" : "Unsandboxed";
+    QString mode = sandboxed ? icon + " Sandbox root" : icon + " Unsandboxed";
 
-    auto* item = new QListWidgetItem(
-        QString("%1  PID %-7  Box: %-14  %2")
-            .arg(icon).arg(sp.pid).arg(box).arg(mode));
-    item->setData(Qt::UserRole, (uint)sp.pid);
-    item->setForeground(sandboxed ? QColor(0x00,0xcc,0x66)
-                                  : QColor(0x55,0xaa,0xff));
-    m_processList->addItem(item);
-    m_processList->scrollToBottom();
+    auto* item = new QTreeWidgetItem({
+        QString::number(sp.pid),
+        box,
+        sandboxed ? "0" : "—",
+        sandboxed ? QString::number(sp.pid) : "—",
+        mode
+    });
+    item->setData(0, Qt::UserRole, static_cast<uint>(sp.pid));
+    item->setData(0, Qt::UserRole + 1, sandboxed);
+
+    QColor color = sandboxed ? QColor(0x00,0xcc,0x66)
+                             : QColor(0x55,0xaa,0xff);
+    for (int c = 0; c < m_processTree->columnCount(); ++c)
+        item->setForeground(c, color);
+
+    m_processTree->addTopLevelItem(item);
+    m_processTree->scrollToItem(item);
+}
+
+void MainWindow::refreshProcessTreeFromDriver(const SANDBOX_PROCESS_LIST& list)
+{
+    for (int i = m_processTree->topLevelItemCount() - 1; i >= 0; --i) {
+        auto* item = m_processTree->topLevelItem(i);
+        if (item->data(0, Qt::UserRole + 1).toBool())
+            delete m_processTree->takeTopLevelItem(i);
+    }
+
+    std::unordered_map<DWORD, const SANDBOX_PROCESS_ENTRY*> byPid;
+    byPid.reserve(list.Count);
+    for (ULONG i = 0; i < list.Count && i < SANDBOX_MAX_TRACKED_PIDS; ++i)
+        byPid[list.Entries[i].ProcessId] = &list.Entries[i];
+
+    std::unordered_map<DWORD, QTreeWidgetItem*> items;
+    std::function<QTreeWidgetItem*(DWORD)> addEntry = [&](DWORD pid) -> QTreeWidgetItem* {
+        auto existing = items.find(pid);
+        if (existing != items.end())
+            return existing->second;
+
+        auto found = byPid.find(pid);
+        if (found == byPid.end())
+            return nullptr;
+
+        const auto* entry = found->second;
+        const bool isRoot = entry->ProcessId == entry->RootProcessId ||
+            entry->ParentProcessId == 0;
+
+        QTreeWidgetItem* parent = nullptr;
+        if (!isRoot && entry->ParentProcessId != 0 &&
+            entry->ParentProcessId != entry->ProcessId) {
+            parent = addEntry(entry->ParentProcessId);
+        }
+        if (!parent && !isRoot && entry->RootProcessId != 0 &&
+            entry->RootProcessId != entry->ProcessId) {
+            parent = addEntry(entry->RootProcessId);
+        }
+
+        auto* item = new QTreeWidgetItem({
+            QString::number(entry->ProcessId),
+            QString::fromWCharArray(entry->BoxName),
+            entry->ParentProcessId ? QString::number(entry->ParentProcessId) : "—",
+            entry->RootProcessId ? QString::number(entry->RootProcessId) : "—",
+            isRoot ? "⬡ Sandbox root" : "↳ Sandbox child"
+        });
+        item->setData(0, Qt::UserRole, static_cast<uint>(entry->ProcessId));
+        item->setData(0, Qt::UserRole + 1, true);
+
+        QColor color = isRoot ? QColor(0x00,0xcc,0x66) : QColor(0x88,0xdd,0xaa);
+        for (int c = 0; c < m_processTree->columnCount(); ++c)
+            item->setForeground(c, color);
+
+        if (parent)
+            parent->addChild(item);
+        else
+            m_processTree->addTopLevelItem(item);
+
+        items[pid] = item;
+        return item;
+    };
+
+    for (const auto& pair : byPid)
+        addEntry(pair.first);
+
+    m_processTree->expandAll();
 }
