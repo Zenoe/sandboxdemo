@@ -96,6 +96,7 @@ private:
     SandboxExplorer m_explorer;                                // ← NEW
     ProcessMonitor* m_monitor    = nullptr;
     QTimer*         m_statsTimer = nullptr;
+    QTimer*         m_borderTimer = nullptr;
 
     std::vector<SandboxedProcess> m_normalProcs;
     std::vector<SandboxedProcess> m_sandboxProcs;

@@ -93,10 +93,14 @@ static constexpr wchar_t g_PipeName[] = SANDBOX_PIPE_NAME;
 
 // Per-target companion tracking
 struct CompanionEntry {
-    HWND target;     // the sandboxed app window
-    HWND companion;  // our overlay window
+    HWND    target;        // the sandboxed app window
+    HWND    companion;     // our overlay window
+    WNDPROC originalProc;  // target WndProc before our subclass
+    bool    hoverTitle;
+    bool    moving;
+    bool    trackingLeave;
 };
-static std::mutex               g_compMutex;
+static std::recursive_mutex     g_compMutex;
 static std::vector<CompanionEntry> g_companions;
 
 // WinEventHook handle
@@ -105,29 +109,53 @@ static HWINEVENTHOOK g_winEventHook = nullptr;
 // CBT hook (in-process, current thread only)
 static HHOOK g_cbtHook = nullptr;
 
+static LRESULT CALLBACK TargetWndProc(HWND hWnd, UINT msg,
+                                       WPARAM wParam, LPARAM lParam);
+
 // ============================================================
 //  FindCompanion / RemoveCompanion
 // ============================================================
 static HWND FindCompanion(HWND target)
 {
-    std::lock_guard<std::mutex> lk(g_compMutex);
+    std::lock_guard<std::recursive_mutex> lk(g_compMutex);
     for (auto& e : g_companions)
         if (e.target == target) return e.companion;
     return nullptr;
 }
 
+static CompanionEntry* FindCompanionEntryLocked(HWND target)
+{
+    for (auto& e : g_companions)
+        if (e.target == target) return &e;
+    return nullptr;
+}
+
 static void RemoveCompanion(HWND target)
 {
-    std::lock_guard<std::mutex> lk(g_compMutex);
-    auto it = std::remove_if(g_companions.begin(), g_companions.end(),
-        [target](const CompanionEntry& e){ return e.target == target; });
-    g_companions.erase(it, g_companions.end());
+    std::lock_guard<std::recursive_mutex> lk(g_compMutex);
+    for (auto it = g_companions.begin(); it != g_companions.end(); ++it) {
+        if (it->target != target)
+            continue;
+
+        if (IsWindow(it->target) && it->originalProc) {
+            SetWindowLongPtrW(it->target, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(it->originalProc));
+        }
+        g_companions.erase(it);
+        return;
+    }
+}
+
+static bool IsCaptionHit(LRESULT hit)
+{
+    return hit == HTCAPTION || hit == HTSYSMENU || hit == HTMINBUTTON ||
+        hit == HTMAXBUTTON || hit == HTCLOSE || hit == HTHELP;
 }
 
 // ============================================================
 //  RepositionCompanion — sync overlay RECT to target window
 // ============================================================
-static void RepositionCompanion(HWND companion, HWND target)
+static void RepositionCompanion(HWND companion, HWND target, bool show)
 {
     if (!IsWindow(target) || !IsWindow(companion)) return;
 
@@ -137,7 +165,7 @@ static void RepositionCompanion(HWND companion, HWND target)
     int w = rc.right - rc.left;
     int h = rc.bottom - rc.top;
 
-    if (IsIconic(target) || !IsWindowVisible(target)) {
+    if (!show || IsIconic(target) || !IsWindowVisible(target)) {
         ShowWindow(companion, SW_HIDE);
         return;
     }
@@ -145,6 +173,26 @@ static void RepositionCompanion(HWND companion, HWND target)
     // Place companion exactly over the target, above everything
     SetWindowPos(companion, HWND_TOPMOST, x, y, w, h,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void RepositionCompanionToRect(HWND companion, const RECT& rc, bool show)
+{
+    if (!IsWindow(companion)) return;
+    if (!show) {
+        ShowWindow(companion, SW_HIDE);
+        return;
+    }
+
+    SetWindowPos(companion, HWND_TOPMOST,
+                 rc.left, rc.top,
+                 rc.right - rc.left, rc.bottom - rc.top,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
+static void SyncCompanion(CompanionEntry& entry)
+{
+    RepositionCompanion(entry.companion, entry.target,
+        entry.hoverTitle || entry.moving);
 }
 
 // ============================================================
@@ -205,7 +253,8 @@ static LRESULT CALLBACK CompanionWndProc(HWND hWnd, UINT msg,
 // ============================================================
 static HWND CreateCompanion(HWND target)
 {
-    if (FindCompanion(target)) return nullptr; // already have one
+    if (HWND existing = FindCompanion(target))
+        return existing;
 
     RECT rc{};
     GetWindowRect(target, &rc);
@@ -226,14 +275,96 @@ static HWND CreateCompanion(HWND target)
     // Magenta = transparent, yellow = opaque
     SetLayeredWindowAttributes(companion, TRANSPARENT_KEY, 0, LWA_COLORKEY);
 
-    ShowWindow(companion, SW_SHOWNOACTIVATE);
-    UpdateWindow(companion);
+    ShowWindow(companion, SW_HIDE);
 
+    WNDPROC original = reinterpret_cast<WNDPROC>(
+        GetWindowLongPtrW(target, GWLP_WNDPROC));
     {
-        std::lock_guard<std::mutex> lk(g_compMutex);
-        g_companions.push_back({ target, companion });
+        std::lock_guard<std::recursive_mutex> lk(g_compMutex);
+        g_companions.push_back({ target, companion, original, false, false, false });
     }
+
+    if (!SetWindowLongPtrW(target, GWLP_WNDPROC,
+        reinterpret_cast<LONG_PTR>(TargetWndProc))) {
+        DestroyWindow(companion);
+        RemoveCompanion(target);
+        return nullptr;
+    }
+
     return companion;
+}
+
+static LRESULT CALLBACK TargetWndProc(HWND hWnd, UINT msg,
+                                       WPARAM wParam, LPARAM lParam)
+{
+    WNDPROC original = nullptr;
+    {
+        std::lock_guard<std::recursive_mutex> lk(g_compMutex);
+        if (auto* entry = FindCompanionEntryLocked(hWnd)) {
+            original = entry->originalProc;
+
+            switch (msg) {
+            case WM_NCMOUSEMOVE:
+                if (IsCaptionHit((LRESULT)wParam)) {
+                    entry->hoverTitle = true;
+                    if (!entry->trackingLeave) {
+                        TRACKMOUSEEVENT tme{};
+                        tme.cbSize = sizeof(tme);
+                        tme.dwFlags = TME_NONCLIENT | TME_LEAVE;
+                        tme.hwndTrack = hWnd;
+                        entry->trackingLeave = TrackMouseEvent(&tme) == TRUE;
+                    }
+                    SyncCompanion(*entry);
+                }
+                break;
+
+            case WM_NCMOUSELEAVE:
+                entry->hoverTitle = false;
+                entry->trackingLeave = false;
+                SyncCompanion(*entry);
+                break;
+
+            case WM_ENTERSIZEMOVE:
+                entry->moving = true;
+                SyncCompanion(*entry);
+                break;
+
+            case WM_MOVING:
+            case WM_SIZING:
+                if ((entry->moving || entry->hoverTitle) && lParam) {
+                    RepositionCompanionToRect(entry->companion,
+                        *reinterpret_cast<RECT*>(lParam),
+                        true);
+                }
+                break;
+
+            case WM_WINDOWPOSCHANGED:
+                if (entry->moving || entry->hoverTitle)
+                    SyncCompanion(*entry);
+                break;
+
+            case WM_EXITSIZEMOVE:
+                entry->moving = false;
+                SyncCompanion(*entry);
+                break;
+
+            case WM_SHOWWINDOW:
+                SyncCompanion(*entry);
+                break;
+            }
+        }
+    }
+
+    if (msg == WM_NCDESTROY || msg == WM_DESTROY) {
+        HWND comp = FindCompanion(hWnd);
+        if (comp && IsWindow(comp))
+            DestroyWindow(comp);
+        RemoveCompanion(hWnd);
+    }
+
+    return original
+        ? CallWindowProcW(original, hWnd, msg, wParam, lParam)
+        : DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
 // ============================================================
@@ -316,10 +447,14 @@ static void CALLBACK WinEventProc(
     case EVENT_OBJECT_CREATE:
     {
         HWND comp = FindCompanion(hWnd);
-        if (comp)
-            RepositionCompanion(comp, hWnd);
-        else
+        if (comp) {
+            std::lock_guard<std::recursive_mutex> lk(g_compMutex);
+            if (auto* entry = FindCompanionEntryLocked(hWnd))
+                SyncCompanion(*entry);
+        }
+        else {
             AttachToWindow(hWnd); // new window we haven't seen
+        }
         break;
     }
 
@@ -351,14 +486,9 @@ static void CALLBACK WinEventProc(
     case EVENT_OBJECT_REORDER:
     {
         // Re-assert TOPMOST so we stay above the target after z-order changes
-        HWND comp = FindCompanion(hWnd);
-        if (comp) {
-            RECT rc{};
-            GetWindowRect(hWnd, &rc);
-            SetWindowPos(comp, HWND_TOPMOST,
-                         rc.left, rc.top,
-                         rc.right - rc.left, rc.bottom - rc.top,
-                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        std::lock_guard<std::recursive_mutex> lk(g_compMutex);
+        if (auto* entry = FindCompanionEntryLocked(hWnd)) {
+            SyncCompanion(*entry);
         }
         break;
     }
@@ -559,9 +689,14 @@ extern "C" SBAPI BOOL WINAPI SandboxBorder_Uninit(void)
     if (g_winEventHook) { UnhookWinEvent(g_winEventHook); g_winEventHook=nullptr; }
 
     // Destroy all companion windows
-    std::lock_guard<std::mutex> lk(g_compMutex);
-    for (auto& e : g_companions)
+    std::lock_guard<std::recursive_mutex> lk(g_compMutex);
+    for (auto& e : g_companions) {
+        if (IsWindow(e.target) && e.originalProc) {
+            SetWindowLongPtrW(e.target, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(e.originalProc));
+        }
         if (IsWindow(e.companion)) DestroyWindow(e.companion);
+    }
     g_companions.clear();
     return TRUE;
 }

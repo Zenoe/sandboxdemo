@@ -76,9 +76,12 @@ static constexpr int kBorderThickness = 4;
 struct HostBorderEntry {
     HWND target = nullptr;
     HWND overlay = nullptr;
+    bool hoverTitle = false;
+    bool moving = false;
 };
 
 static std::vector<HostBorderEntry> g_hostBorders;
+static HWINEVENTHOOK g_hostMoveHook = nullptr;
 
 static LRESULT CALLBACK HostBorderWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
@@ -139,11 +142,50 @@ static HWND FindHostBorder(HWND target)
     return nullptr;
 }
 
-static void RepositionHostBorder(HWND overlay, HWND target)
+static HostBorderEntry* FindHostBorderEntry(HWND target)
+{
+    for (auto& entry : g_hostBorders)
+        if (entry.target == target)
+            return &entry;
+    return nullptr;
+}
+
+static bool IsHostCaptionHit(LRESULT hit)
+{
+    return hit == HTCAPTION || hit == HTSYSMENU || hit == HTMINBUTTON ||
+        hit == HTMAXBUTTON || hit == HTCLOSE || hit == HTHELP;
+}
+
+static bool IsCursorOverHostTitle(HWND target)
+{
+    if (!IsWindow(target) || !IsWindowVisible(target) || IsIconic(target))
+        return false;
+
+    POINT pt{};
+    if (!GetCursorPos(&pt))
+        return false;
+
+    RECT rc{};
+    if (!GetWindowRect(target, &rc) || !PtInRect(&rc, pt))
+        return false;
+
+    DWORD_PTR hit = 0;
+    if (!SendMessageTimeoutW(target, WM_NCHITTEST, 0,
+        MAKELPARAM(pt.x, pt.y),
+        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+        25,
+        &hit)) {
+        return false;
+    }
+
+    return IsHostCaptionHit((LRESULT)hit);
+}
+
+static void RepositionHostBorder(HWND overlay, HWND target, bool show)
 {
     if (!IsWindow(overlay) || !IsWindow(target)) return;
 
-    if (!IsWindowVisible(target) || IsIconic(target)) {
+    if (!show || !IsWindowVisible(target) || IsIconic(target)) {
         ShowWindow(overlay, SW_HIDE);
         return;
     }
@@ -156,11 +198,84 @@ static void RepositionHostBorder(HWND overlay, HWND target)
     InvalidateRect(overlay, nullptr, FALSE);
 }
 
+static void SyncHostBorder(HostBorderEntry& entry)
+{
+    entry.hoverTitle = IsCursorOverHostTitle(entry.target);
+    RepositionHostBorder(entry.overlay, entry.target,
+        entry.hoverTitle || entry.moving);
+}
+
+static void RefreshHostBorderVisibility()
+{
+    for (auto& entry : g_hostBorders)
+        SyncHostBorder(entry);
+}
+
+static void CALLBACK HostBorderWinEventProc(
+    HWINEVENTHOOK,
+    DWORD event,
+    HWND hwnd,
+    LONG idObject,
+    LONG,
+    DWORD,
+    DWORD)
+{
+    if (idObject != OBJID_WINDOW || !hwnd)
+        return;
+
+    auto* entry = FindHostBorderEntry(hwnd);
+    if (!entry)
+        return;
+
+    switch (event) {
+    case EVENT_SYSTEM_MOVESIZESTART:
+        entry->moving = true;
+        SyncHostBorder(*entry);
+        break;
+    case EVENT_SYSTEM_MOVESIZEEND:
+        entry->moving = false;
+        SyncHostBorder(*entry);
+        break;
+    case EVENT_OBJECT_LOCATIONCHANGE:
+        if (entry->moving || entry->hoverTitle)
+            SyncHostBorder(*entry);
+        break;
+    case EVENT_OBJECT_HIDE:
+    case EVENT_OBJECT_DESTROY:
+        ShowWindow(entry->overlay, SW_HIDE);
+        break;
+    }
+}
+
+static void StartHostBorderHooks()
+{
+    if (g_hostMoveHook)
+        return;
+
+    g_hostMoveHook = SetWinEventHook(
+        EVENT_SYSTEM_MOVESIZESTART,
+        EVENT_OBJECT_LOCATIONCHANGE,
+        nullptr,
+        HostBorderWinEventProc,
+        0,
+        0,
+        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+}
+
+static void StopHostBorderHooks()
+{
+    if (g_hostMoveHook) {
+        UnhookWinEvent(g_hostMoveHook);
+        g_hostMoveHook = nullptr;
+    }
+}
+
 static HWND EnsureHostBorder(HWND target)
 {
     HWND overlay = FindHostBorder(target);
     if (overlay) {
-        RepositionHostBorder(overlay, target);
+        if (auto* entry = FindHostBorderEntry(target))
+            SyncHostBorder(*entry);
         return overlay;
     }
 
@@ -180,7 +295,8 @@ static HWND EnsureHostBorder(HWND target)
 
     SetLayeredWindowAttributes(overlay, kTransparentKey, 0, LWA_COLORKEY);
     g_hostBorders.push_back({ target, overlay });
-    RepositionHostBorder(overlay, target);
+    ShowWindow(overlay, SW_HIDE);
+    SyncHostBorder(g_hostBorders.back());
     return overlay;
 }
 
@@ -206,6 +322,7 @@ MainWindow::MainWindow(QWidget* parent)
     , m_explorer([this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); }) // ← NEW
     , m_monitor(new ProcessMonitor(this))
     , m_statsTimer(new QTimer(this))
+    , m_borderTimer(new QTimer(this))
 {
     setWindowTitle("SandboxFlt Demo  —  Minifilter + Job Object + Namespace Isolation");
     setMinimumSize(1100, 750);
@@ -228,7 +345,12 @@ MainWindow::MainWindow(QWidget* parent)
     connect(m_monitor,    &ProcessMonitor::processExited, this, &MainWindow::onProcessExited);
     connect(m_monitor,    &ProcessMonitor::statusUpdate,  this, &MainWindow::onStatusUpdate);
     connect(m_statsTimer, &QTimer::timeout,               this, &MainWindow::onStatsTimer);
+    connect(m_borderTimer, &QTimer::timeout, this, [] {
+        RefreshHostBorderVisibility();
+    });
     m_statsTimer->start(1500);
+    m_borderTimer->start(33);
+    StartHostBorderHooks();
 
     appendLog("=== SandboxFlt Demo ===");
     appendLog("Step 1: Browse to SandboxFlt.sys → Install → Load");
@@ -247,9 +369,11 @@ MainWindow::MainWindow(QWidget* parent)
 
 MainWindow::~MainWindow()
 {
+    m_borderTimer->stop();
     m_statsTimer->stop();
     m_monitor->stopAll();
     m_explorer.stopPipeServer();   // ← NEW: clean up pipe thread
+    StopHostBorderHooks();
     for (auto& entry : g_hostBorders) {
         if (IsWindow(entry.overlay))
             DestroyWindow(entry.overlay);
@@ -860,7 +984,7 @@ void MainWindow::updateSandboxWindowBorders()
             it = g_hostBorders.erase(it);
         }
         else {
-            RepositionHostBorder(it->overlay, it->target);
+            SyncHostBorder(*it);
             ++it;
         }
     }
