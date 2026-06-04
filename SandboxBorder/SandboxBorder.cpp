@@ -547,7 +547,27 @@ using PFN_ShellExecuteW = HINSTANCE(WINAPI*)(
 static PFN_SHOpenFolderAndSelectItems g_origSHOpen        = nullptr;
 static PFN_ShellExecuteW              g_origShellExecuteW = nullptr;
 
-static void NotifyHostOpenFolder(const wchar_t* realPath)
+static std::string JsonEscapeUtf8(const char* text)
+{
+    std::string esc;
+    if (!text) return esc;
+
+    for (char c : std::string(text)) {
+        switch (c) {
+        case '\\': esc += "\\\\"; break;
+        case '"':  esc += "\\\""; break;
+        case '\b': esc += "\\b"; break;
+        case '\f': esc += "\\f"; break;
+        case '\n': esc += "\\n"; break;
+        case '\r': esc += "\\r"; break;
+        case '\t': esc += "\\t"; break;
+        default:   esc += c; break;
+        }
+    }
+    return esc;
+}
+
+static void NotifyHostOpenFolder(const wchar_t* realPath, bool selectTarget)
 {
     HANDLE hPipe = CreateFileW(g_PipeName, GENERIC_WRITE, 0, nullptr,
                                OPEN_EXISTING, 0, nullptr);
@@ -558,14 +578,16 @@ static void NotifyHostOpenFolder(const wchar_t* realPath)
     WideCharToMultiByte(CP_UTF8,0,g_BoxName,-1,boxUtf8,sizeof(boxUtf8),nullptr,nullptr);
     WideCharToMultiByte(CP_UTF8,0,realPath, -1,pathUtf8,sizeof(pathUtf8),nullptr,nullptr);
 
-    std::string esc;
-    for (char c : std::string(pathUtf8))
-        esc += (c == '\\') ? std::string("\\\\") : std::string(1,c);
+    std::string esc = JsonEscapeUtf8(pathUtf8);
 
-    char buf[1024];
+    char buf[1400];
     int len = _snprintf_s(buf, sizeof(buf), _TRUNCATE,
-        "{\"cmd\":\"openFolder\",\"box\":\"%s\",\"path\":\"%s\"}\n",
-        boxUtf8, esc.c_str());
+        "{\"cmd\":\"openFolder\",\"box\":\"%s\",\"path\":\"%s\",\"select\":\"%s\"}\n",
+        boxUtf8, esc.c_str(), selectTarget ? "1" : "0");
+    if (len <= 0) {
+        CloseHandle(hPipe);
+        return;
+    }
     DWORD w = 0;
     WriteFile(hPipe, buf, (DWORD)len, &w, nullptr);
     CloseHandle(hPipe);
@@ -603,7 +625,21 @@ static HRESULT WINAPI Hook_SHOpenFolderAndSelectItems(
     PCIDLIST_ABSOLUTE pidl, UINT c, PCUITEMID_CHILD_ARRAY a, DWORD f)
 {
     wchar_t path[MAX_PATH]={};
-    if (SHGetPathFromIDListW(pidl,path)) { NotifyHostOpenFolder(path); return S_OK; }
+    bool selectTarget = false;
+
+    if (pidl && c > 0 && a && a[0]) {
+        PIDLIST_ABSOLUTE full = ILCombine(pidl, a[0]);
+        if (full) {
+            if (SHGetPathFromIDListW(full, path))
+                selectTarget = true;
+            CoTaskMemFree(full);
+        }
+    }
+
+    if ((selectTarget || SHGetPathFromIDListW(pidl,path))) {
+        NotifyHostOpenFolder(path, selectTarget);
+        return S_OK;
+    }
     return g_origSHOpen ? g_origSHOpen(pidl,c,a,f) : E_FAIL;
 }
 
@@ -614,7 +650,7 @@ static HINSTANCE WINAPI Hook_ShellExecuteW(
     if (isOpen && file) {
         DWORD a=GetFileAttributesW(file);
         if (a!=INVALID_FILE_ATTRIBUTES && (a&FILE_ATTRIBUTE_DIRECTORY)) {
-            NotifyHostOpenFolder(file);
+            NotifyHostOpenFolder(file, false);
             return (HINSTANCE)(INT_PTR)42;
         }
     }

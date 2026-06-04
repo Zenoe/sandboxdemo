@@ -11,6 +11,7 @@
 #include <cassert>
 #include <algorithm>
 #include <fstream>
+#include <shlobj.h>
 
 namespace fs = std::filesystem;
 
@@ -53,6 +54,25 @@ static std::string jsonEscape(const std::string& text)
         }
     }
     return out;
+}
+
+static std::wstring getKnownDownloadsPath()
+{
+    PWSTR downloads = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Downloads,
+        KF_FLAG_DEFAULT, nullptr, &downloads)) && downloads) {
+        std::wstring path(downloads);
+        CoTaskMemFree(downloads);
+        return path;
+    }
+
+    wchar_t userProfile[MAX_PATH] = {};
+    DWORD len = GetEnvironmentVariableW(L"USERPROFILE", userProfile,
+        MAX_PATH);
+    if (len > 0 && len < MAX_PATH)
+        return std::wstring(userProfile) + L"\\Downloads";
+
+    return L"C:\\Users\\Public\\Downloads";
 }
 
 static DWORD makeSandboxPathWritable(const std::wstring& path)
@@ -579,7 +599,7 @@ std::wstring SandboxEngine::prepareFsRoot(const std::wstring& base,
         std::ofstream prefs(prefsPath, std::ios::binary | std::ios::trunc);
         if (prefs) {
             std::string downloads = jsonEscape(
-                utf8FromWide(root + L"\\drive\\Downloads"));
+                utf8FromWide(getKnownDownloadsPath()));
             prefs
                 << "{"
                 << "\"download\":{"

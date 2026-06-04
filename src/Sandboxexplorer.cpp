@@ -104,10 +104,11 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
             buf[read] = '\0';
             std::string json(buf);
 
-            // Parse: {"cmd":"openFolder","box":"Box00","path":"C:\\..."}
+            // Parse: {"cmd":"openFolder","box":"Box00","path":"C:\\...","select":"1"}
             std::string cmd  = jsonGetField(json, "cmd");
             std::string box  = jsonGetField(json, "box");
             std::string path = jsonGetField(json, "path");
+            std::string select = jsonGetField(json, "select");
 
             if (cmd == "openFolder" && !box.empty() && !path.empty()) {
                 // Convert UTF-8 fields to wide strings
@@ -117,7 +118,8 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
                 log(L"[Explorer] openFolder request: box=" + wBox +
                     L" path=" + wPath);
 
-                openFolderInSandbox(*driver, *engine, wBox, wPath, fsRootBase);
+                openFolderInSandbox(*driver, *engine, wBox, wPath, fsRootBase,
+                                    select == "1");
             }
         }
 
@@ -129,21 +131,21 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
 // ============================================================
 //  openFolderInSandbox
 //
-//  Maps the real Chrome download path to the sandbox virtual
-//  path, then launches:
+//  Launches:
 //
-//    explorer.exe /select,"<virtualPath>\<selectedFile>"
+//    explorer.exe "<realFolder>"
+//    explorer.exe /select,"<realFile>"
 //
 //  inside the same box so the minifilter gives it the merged
-//  (host + sandbox overlay) directory view — exactly like the
-//  Notepad save dialog already works.
+//  (host + sandbox overlay) directory view while Explorer still
+//  displays the normal host path, e.g. C:\Users\admin\Downloads.
 //
 //  The Explorer instance is:
 //    - Assigned to the box's Job Object (via SandboxEngine::launch)
 //    - Its PID is registered with the driver (addProcess)
 //    - SandboxBorder.dll is injected into it for the yellow border
 //
-//  After injection, Explorer opens at the virtual path.  The
+//  After injection, Explorer opens at the real path.  The
 //  PostDirectoryControl hook in SandboxFlt_Filter.c merges
 //  host entries + sandbox entries, so the user sees everything.
 // ============================================================
@@ -151,29 +153,19 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
                                            SandboxEngine&       engine,
                                            const std::wstring&  boxName,
                                            const std::wstring&  realPath,
-                                           const std::wstring&  fsRootBase)
+                                           const std::wstring&  fsRootBase,
+                                           bool                 selectTarget)
 {
-    // 1. Compute sandbox root for this box
-    //    e.g. C:\SandboxDemo\Box00
-    std::wstring boxRoot = fsRootBase + L"\\" + boxName;
+    // 1. Keep Explorer on the real path.  The Explorer process itself is
+    //    sandboxed, so directory enumeration of this real folder is merged by
+    //    the driver with the box overlay's matching relative path.
+    std::wstring explorerArgs = selectTarget
+        ? (L"/select,\"" + realPath + L"\"")
+        : (L"\"" + realPath + L"\"");
+    log(L"[Explorer] Explorer path: " + realPath +
+        (selectTarget ? L" (select)" : L""));
 
-    // 2. Map real path → virtual path
-    //    C:\Users\foo\Downloads →
-    //    C:\SandboxDemo\Box00\drive\Users\foo\Downloads
-    std::wstring virtualPath = realToVirtual(realPath, boxRoot);
-    log(L"[Explorer] Virtual path: " + virtualPath);
-
-    // 3. Ensure the virtual directory exists (may not if Chrome hasn't
-    //    written anything there yet — in that case we open the sandbox
-    //    root's drive folder so the user at least sees something)
-    DWORD attr = GetFileAttributesW(virtualPath.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES ||
-        !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-        virtualPath = boxRoot + L"\\drive";
-        log(L"[Explorer] Virtual path not found; falling back to " + virtualPath);
-    }
-
-    // 4. Launch explorer.exe /select,"<virtualPath>" sandboxed
+    // 2. Launch Explorer sandboxed
     //    We use SandboxEngine::launch which:
     //      a) Creates a Job Object (KillOnClose=false so Explorer lives independently)
     //      b) Creates the private namespace
@@ -186,7 +178,7 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
     SandboxConfig cfg;
     cfg.boxName        = boxName;
     cfg.executablePath = explorerPath;
-    cfg.commandLine    = L"/select,\"" + virtualPath + L"\"";
+    cfg.commandLine    = explorerArgs;
     cfg.fsRootBase     = fsRootBase;
     cfg.restrictUI     = false;   // Explorer needs full UI access
     cfg.killOnClose    = false;   // Don't kill Explorer when we close
@@ -230,40 +222,8 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
     }
 
     log(L"[Explorer] Sandboxed Explorer PID " +
-        std::to_wstring(sp.pid) + L" running at: " + virtualPath);
+        std::to_wstring(sp.pid) + L" running at: " + realPath);
     return true;
-}
-
-// ============================================================
-//  realToVirtual
-//
-//  Maps a real Win32 path to the sandbox's drive overlay.
-//
-//  Real:     C:\Users\foo\Downloads\file.zip
-//  BoxRoot:  C:\SandboxDemo\Box00
-//  Virtual:  C:\SandboxDemo\Box00\drive\Users\foo\Downloads\file.zip
-//
-//  The mapping strips the drive letter + colon, prepends the
-//  box root and the "\drive" overlay folder.  This mirrors
-//  how SandboxEngine::prepareFsRoot lays out the directory tree.
-// ============================================================
-std::wstring SandboxExplorer::realToVirtual(const std::wstring& realPath,
-                                             const std::wstring& boxRoot)
-{
-    // Normalise slashes
-    std::wstring norm = realPath;
-    std::replace(norm.begin(), norm.end(), L'/', L'\\');
-
-    // Strip drive letter (e.g. "C:")
-    std::wstring rel = norm;
-    if (rel.size() >= 2 && rel[1] == L':')
-        rel = rel.substr(2);  // → \Users\foo\Downloads
-
-    // Ensure leading backslash
-    if (rel.empty() || rel[0] != L'\\')
-        rel = L'\\' + rel;
-
-    return boxRoot + L"\\drive" + rel;
 }
 
 // ============================================================

@@ -7,9 +7,10 @@
 //  PROBLEM:
 //    Chrome's "Show in folder" calls SHOpenFolderAndSelectItems
 //    with the REAL download path (e.g. C:\Users\foo\Downloads).
-//    This opens an *unsandboxed* Explorer that sees only the real
-//    filesystem — none of the files Chrome wrote to the sandbox
-//    virtual root (C:\SandboxDemo\Box00\drive\Users\foo\Downloads).
+//    This must open Explorer at the real path, but with Explorer itself
+//    inside the same box so the minifilter can merge the host directory with
+//    the sandbox overlay
+//    (C:\SandboxDemo\Box00\drive\Users\foo\Downloads).
 //
 //  SANDBOXIE'S APPROACH:
 //    1. Inject SbieDll.dll into every sandboxed process.
@@ -73,7 +74,7 @@ public:
 
     // ---- Sandboxed Explorer launch ----------------------------
 
-    // Launch explorer.exe /select,"<virtualPath>" inside the box.
+    // Launch explorer.exe at the real path inside the box.
     // Called by the pipe server when it receives an openFolder request.
     //
     // boxName:      the box the request came from
@@ -83,7 +84,8 @@ public:
                              SandboxEngine&       engine,
                              const std::wstring&  boxName,
                              const std::wstring&  realPath,
-                             const std::wstring&  fsRootBase);
+                             const std::wstring&  fsRootBase,
+                             bool                 selectTarget);
 
     // Default DLL path: same directory as the host EXE
     static std::wstring defaultDllPath();
@@ -97,11 +99,6 @@ private:
     void pipeServerLoop(DriverManager*    driver,
                         SandboxEngine*    engine,
                         std::wstring      fsRootBase);
-
-    // Map a real Win32 path to the sandbox overlay path.
-    // e.g. "C:\Users\foo\Downloads" → "C:\SandboxDemo\Box00\drive\Users\foo\Downloads"
-    static std::wstring realToVirtual(const std::wstring& realPath,
-                                      const std::wstring& boxRoot);
 
     // Minimal JSON field extractor (avoids a JSON library dependency)
     static std::string  jsonGetField(const std::string& json,

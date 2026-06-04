@@ -19,8 +19,9 @@
 //   3. Watches for SHOpenFolderAndSelectItems / ShellExecute
 //      "open" verbs that Chrome fires for "Show in folder".
 //      When detected, it marshals the call to a helper that
-//      launches a NEW sandboxed Explorer pointing at the
-//      virtual (sandbox) download path, instead of the real one.
+//      launches a NEW sandboxed Explorer pointing at the real
+//      download path.  Because Explorer is in the same box, the
+//      minifilter merges the host folder with the sandbox overlay.
 //
 //  IPC between the DLL and the Qt host uses a single named pipe:
 //      \\.\pipe\SandboxFlt_Broker
