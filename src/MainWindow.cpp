@@ -46,6 +46,20 @@ static QLineEdit* makeEdit(const QString& ph, const QFont& f) {
     return e;
 }
 
+ static QComboBox * makeCombo(const QFont & f) {
+    auto* c = new QComboBox;
+    c->setEditable(true);
+    c->setFont(f);
+    c->setStyleSheet(
+        "QComboBox{background:#0e0e16;color:#d8d8e8;border:1px solid #2a2a3a;"
+         "border-radius:3px;padding:2px 6px;}"
+         "QComboBox:focus{border-color:#0af;}"
+         "QComboBox QAbstractItemView{background:#15151f;color:#ccc;}");
+    return c;
+    
+}
+
+
 static QPushButton* makeBtn(const QString& t, const QString& col,
                              int minH = 30) {
     auto* b = new QPushButton(t);
@@ -471,8 +485,16 @@ void MainWindow::setupUi()
     auto* cfgGrid  = new QGridLayout(cfgGroup);
     cfgGrid->setSpacing(5);
 
-    m_exePath   = makeEdit("C:\\Windows\\notepad.exe", mono);
-    m_exePath->setText("C:\\Windows\\notepad.exe");
+    //m_exePath   = makeEdit("C:\\Windows\\notepad.exe", mono);
+    //m_exePath->setText("C:\\Windows\\notepad.exe");
+    m_exePath = makeCombo(mono);
+    m_exePath->addItems({
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Windows\\notepad.exe",
+    "C:\\Users\\admin\\AppData\\Local\\Chromium\\Application\\chrome.exe",
+    "C:\\Windows\\System32\\cmd.exe"
+     });
+
     m_boxName   = makeEdit("Box00", mono);
     m_boxName->setText("Box00");
     m_fsRoot    = makeEdit("C:\\SandboxDemo", mono);
@@ -694,12 +716,12 @@ void MainWindow::onBrowseExe()
     QString p = QFileDialog::getOpenFileName(this, "Select Executable",
         "C:\\Windows", "Executables (*.exe);;All (*.*)");
     if (!p.isEmpty())
-        m_exePath->setText(QDir::toNativeSeparators(p));
+        m_exePath->setEditText(QDir::toNativeSeparators(p));
 }
 
 void MainWindow::onLaunchNormal()
 {
-    QString exe = m_exePath->text().trimmed();
+    QString exe = m_exePath->currentText().trimmed();
     if (exe.isEmpty()) { appendLog("! No executable."); return; }
     appendLog("--- Launch NORMAL: " + exe + " ---");
 
@@ -722,7 +744,7 @@ void MainWindow::onLaunchNormal()
 
 void MainWindow::onLaunchSandboxed()
 {
-    QString exe = m_exePath->text().trimmed();
+    QString exe = m_exePath->currentText().trimmed();
     if (exe.isEmpty()) { appendLog("! No executable."); return; }
     QString exeLower = exe.toLower();
     const bool isChromium = exeLower.contains("chrome") ||

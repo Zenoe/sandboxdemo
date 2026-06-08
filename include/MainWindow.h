@@ -72,7 +72,7 @@ private:
     QLabel* m_lblLastPath  = nullptr;
 
     // ---- Launch panel ----
-    QLineEdit*   m_exePath       = nullptr;
+    QComboBox*   m_exePath       = nullptr;
     QLineEdit*   m_boxName       = nullptr;
     QLineEdit*   m_fsRoot        = nullptr;
     QLineEdit*   m_extraArgs     = nullptr;
