@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // ============================================================
 //  SandboxFlt.h  -  Kernel-internal definitions
 //  NOT included from user mode code.
@@ -86,6 +86,7 @@ typedef struct _SANDBOX_GLOBALS {
     volatile LONG   TotalPassThrough;
 
     WCHAR           LastRedirectedPath[SANDBOX_MAX_PATH];
+    KSPIN_LOCK      LastRedirectedPathLock;   // guards LastRedirectedPath
     BOOLEAN         ProcessNotifyRegistered;
 } SANDBOX_GLOBALS, * PSANDBOX_GLOBALS;
 
@@ -209,14 +210,13 @@ BOOLEAN Path_StartsWith(
 NTSTATUS Path_BuildRedirect(
     _In_  PC_UNICODE_STRING  OriginalPath,
     _In_  PBOX_ENTRY         Box,
-    _Out_ PUNICODE_STRING    RedirectedPath,
-    _Out_ PWCHAR* AllocatedBuffer);
+    _Out_ PUNICODE_STRING    RedirectedPath
+  );
 
 NTSTATUS Path_BuildRedirectRelative(
     _In_  PC_UNICODE_STRING  OriginalPath,
     _In_  PBOX_ENTRY         Box,
-    _Out_ PUNICODE_STRING    RedirectedPath,
-    _Out_ PWCHAR* AllocatedBuffer);
+    _Out_ PUNICODE_STRING    RedirectedPath);
 
 // PID bitmap — maintained by BoxMgr (Tier 1)
 VOID PidBitmap_OnAdd(_In_ ULONG Pid);

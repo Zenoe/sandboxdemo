@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 //  SandboxFlt_Filter.c  -  IRP_MJ_CREATE pre/post callbacks
 //
 //  PERFORMANCE ARCHITECTURE  v3  (based on Sandboxie source study)
@@ -145,6 +145,7 @@
 //    and the sandbox root itself (BUG 1 above).
 // ============================================================
 #include "SandboxFlt.h"
+#include <wdm.h>
 
 // ============================================================
 //  TIER 0 — global active-box counter
@@ -578,8 +579,7 @@ NTSTATUS
 Path_BuildRedirect(
     _In_  PC_UNICODE_STRING  OriginalPath,
     _In_  PBOX_ENTRY         Box,
-    _Out_ PUNICODE_STRING    RedirectedPath,
-    _Out_ PWCHAR* AllocatedBuffer)
+    _Out_ PUNICODE_STRING    RedirectedPath)
 {
     USHORT i, slashCount, volumeEnd, charCount, totalChars, off;
     PWCHAR p, buf;
@@ -623,7 +623,6 @@ Path_BuildRedirect(
     RedirectedPath->Buffer = buf;
     RedirectedPath->Length = (USHORT)(off * sizeof(WCHAR));
     RedirectedPath->MaximumLength = (USHORT)(totalChars * sizeof(WCHAR));
-    *AllocatedBuffer = buf;
     return STATUS_SUCCESS;
 }
 
@@ -631,8 +630,7 @@ NTSTATUS
 Path_BuildRedirectRelative(
     _In_  PC_UNICODE_STRING  OriginalPath,
     _In_  PBOX_ENTRY         Box,
-    _Out_ PUNICODE_STRING    RedirectedPath,
-    _Out_ PWCHAR* AllocatedBuffer)
+    _Out_ PUNICODE_STRING    RedirectedPath)
 {
     USHORT i, slashCount, volumeEnd, charCount, totalChars, off;
     PWCHAR p, buf;
@@ -672,7 +670,6 @@ Path_BuildRedirectRelative(
     RedirectedPath->Buffer = buf;
     RedirectedPath->Length = (USHORT)(off * sizeof(WCHAR));
     RedirectedPath->MaximumLength = (USHORT)(totalChars * sizeof(WCHAR));
-    *AllocatedBuffer = buf;
     return STATUS_SUCCESS;
 }
 
@@ -703,16 +700,18 @@ SandboxFlt_PreCreate(
     UNICODE_STRING             fullPath;
     UNICODE_STRING             fileObjectPath;
     UNICODE_STRING             relPath;
-    PWCHAR                     fullPathBuf;
-    PWCHAR                     fileObjectPathBuf;
     NTSTATUS                   status;
     USHORT                     copyLen;
     USHORT                     volumeEnd;
     ULONG                      pid;
     ULONG                      writeKey;
     ULONG                      parentKey;
-
+    KIRQL                      oldIrql;      // BUG D FIX: needed for spinlock
     *CompletionContext = NULL;
+
+    // Initialize path buffers to NULL so cleanup is safe on all exit paths.
+    fullPath.Buffer = NULL;
+    fileObjectPath.Buffer = NULL;
 
     /* ---- TIER 0 ---- */
     if (g_AnyBoxActive == 0)
@@ -771,8 +770,6 @@ SandboxFlt_PreCreate(
 
     /* ---- Get file name (OPENED, not NORMALIZED) ---- */
     nameInfo = NULL;
-    fullPathBuf = NULL;
-    fileObjectPathBuf = NULL;
     status = FltGetFileNameInformation(Data,
         FLT_FILE_NAME_OPENED | FLT_FILE_NAME_QUERY_DEFAULT,
         &nameInfo);
@@ -829,10 +826,6 @@ SandboxFlt_PreCreate(
 
     if (!doRedirect) {
         FltReleaseFileNameInformation(nameInfo);
-        if (fullPathBuf) {
-            ExFreePoolWithTag(fullPathBuf, SANDBOX_POOL_TAG);
-            fullPathBuf = NULL;
-        }
         InterlockedIncrement(&g_Sandbox.TotalPassThrough);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -843,18 +836,20 @@ SandboxFlt_PreCreate(
      * selected, which is volume-relative for ordinary creates.
      */
     // fullPath: "\Device\HarddiskVolume4\SandboxDemo\Box00\drive\Users\admin"
-    status = Path_BuildRedirect(&nameInfo->Name, box,
-        &fullPath, &fullPathBuf);
+    status = Path_BuildRedirect(&nameInfo->Name, box, &fullPath);
     if (NT_SUCCESS(status)) {
         //fileObjectPath: ""\SandboxDemo\Box00\drive\Users\admin""
         status = Path_BuildRedirectRelative(&nameInfo->Name, box,
-            &fileObjectPath, &fileObjectPathBuf);
+            &fileObjectPath);
     }
     FltReleaseFileNameInformation(nameInfo);
 
     if (!NT_SUCCESS(status)) {
-        if (fullPathBuf)
-            ExFreePoolWithTag(fullPathBuf, SANDBOX_POOL_TAG);
+        // BUG B FIX: if Path_BuildRedirect succeeded but
+        // Path_BuildRedirectRelative failed, fullPath.Buffer is already
+        // allocated and must be freed here before returning.
+        if (fullPath.Buffer)
+            ExFreePoolWithTag(fullPath.Buffer, SANDBOX_POOL_TAG);
         InterlockedIncrement(&g_Sandbox.TotalPassThrough);
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
@@ -886,11 +881,18 @@ SandboxFlt_PreCreate(
         FltSetCallbackDataDirty(Data);
         InterlockedIncrement(&g_Sandbox.TotalRedirects);
 		// Cache the last redirected path for debugging purposes.  We truncate to fit the buffer, but that's fine since it's only for diagnostics and not used in any logic.
+        // BUG D FIX: LastRedirectedPath is a shared global written from any
+        // arbitrary thread.  Protect the copy + NUL-termination with the
+        // dedicated spinlock to prevent a data race on SMP systems.
+        // (This field is diagnostic-only, so a spinlock is sufficient and
+        // keeps the fast path cheap.)
         copyLen = min(fullPath.Length,
             (SANDBOX_MAX_PATH - 1) * sizeof(WCHAR));
+        KeAcquireSpinLock(&g_Sandbox.LastRedirectedPathLock, &oldIrql);
         RtlCopyMemory(g_Sandbox.LastRedirectedPath,
             fullPath.Buffer, copyLen);
         g_Sandbox.LastRedirectedPath[copyLen / sizeof(WCHAR)] = L'\0';
+        KeReleaseSpinLock(&g_Sandbox.LastRedirectedPathLock, oldIrql);
         if (isWrite)
 			// Cache the write-intent path for redirecting future reads without needing to parse the full path again.
             Cache_Add(g_WritePathCache, WRITE_PATH_CACHE_SIZE, writeKey);
@@ -899,12 +901,15 @@ SandboxFlt_PreCreate(
     else {
         InterlockedIncrement(&g_Sandbox.TotalPassThrough);
         DbgPrint("[SandboxFlt] IoReplaceFileObjectName failed: %08x\n", status);
+		if (fileObjectPath.Buffer)
+			ExFreePoolWithTag(fileObjectPath.Buffer, SANDBOX_POOL_TAG);
     }
 
-    if (fileObjectPathBuf)
-        ExFreePoolWithTag(fileObjectPathBuf, SANDBOX_POOL_TAG);
-    if (fullPathBuf)
-        ExFreePoolWithTag(fullPathBuf, SANDBOX_POOL_TAG);
+	// BUG B FIX: fullPath.Buffer is always caller-owned regardless of
+    // IoReplaceFileObjectName's outcome.  Free it unconditionally here,
+	// after all uses (DbgPrint above) are complete.
+    if (fullPath.Buffer)
+        ExFreePoolWithTag(fullPath.Buffer, SANDBOX_POOL_TAG);
     return FLT_PREOP_SUCCESS_NO_CALLBACK;
 }
 
@@ -1015,26 +1020,24 @@ DirQuery_GetSystemBuffer(_In_ PFLT_CALLBACK_DATA Data)
     return Data->Iopb->Parameters.DirectoryControl.QueryDirectory.DirectoryBuffer;
 }
 
-static NTSTATUS
+NTSTATUS
 DirMerge_OpenSandboxDirectory(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
     _In_ PBOX_ENTRY Box,
     _Outptr_ PDIR_MERGE_CONTEXT* OutCtx)
 {
-    PFLT_FILE_NAME_INFORMATION nameInfo;
-    PDIR_MERGE_CONTEXT ctx;
-    PFLT_CONTEXT rawCtx;
-    UNICODE_STRING sandboxPath;
-    PWCHAR sandboxPathBuf;
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    PDIR_MERGE_CONTEXT ctx = NULL;
+    PFLT_CONTEXT rawCtx = NULL;
+    UNICODE_STRING sandboxPath = { 0 };
     OBJECT_ATTRIBUTES oa;
     IO_STATUS_BLOCK iosb;
     NTSTATUS status;
+    BOOLEAN pathAllocated = FALSE;
 
     *OutCtx = NULL;
-    nameInfo = NULL;
-    sandboxPathBuf = NULL;
-    rawCtx = NULL;
 
+    // 1. Get file name information
     status = FltGetFileNameInformationUnsafe(FltObjects->FileObject,
         FltObjects->Instance,
         FLT_FILE_NAME_OPENED | FLT_FILE_NAME_QUERY_DEFAULT,
@@ -1045,28 +1048,34 @@ DirMerge_OpenSandboxDirectory(
     status = FltParseFileNameInformation(nameInfo);
     if (NT_SUCCESS(status)) {
         status = Path_BuildRedirect((PC_UNICODE_STRING)&nameInfo->Name,
-            Box, &sandboxPath, &sandboxPathBuf);
+            Box, &sandboxPath);
+        if (NT_SUCCESS(status)) {
+            pathAllocated = TRUE;
+        }
     }
     FltReleaseFileNameInformation(nameInfo);
+
     if (!NT_SUCCESS(status))
         return status;
 
+    // 2. Allocate Minifilter Context
     status = FltAllocateContext(g_Sandbox.FilterHandle,
         FLT_STREAMHANDLE_CONTEXT,
         sizeof(DIR_MERGE_CONTEXT),
         NonPagedPool,
         &rawCtx);
     if (!NT_SUCCESS(status)) {
-        ExFreePoolWithTag(sandboxPathBuf, SANDBOX_POOL_TAG);
-        return status;
+        goto Cleanup;
     }
+
     ctx = (PDIR_MERGE_CONTEXT)rawCtx;
     RtlZeroMemory(ctx, sizeof(*ctx));
 
+    // 3. Initialize attributes and open the sandbox directory
     InitializeObjectAttributes(&oa, &sandboxPath,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-	// open sandbox directory by kernel privilege, retrieving the handle
+    // open sandbox directory by kernel privilege, retrieving the handle
     status = FltCreateFileEx(g_Sandbox.FilterHandle,
         FltObjects->Instance,
         &ctx->SandboxHandle,
@@ -1083,36 +1092,62 @@ DirMerge_OpenSandboxDirectory(
         0,
         IO_IGNORE_SHARE_ACCESS_CHECK);
 
-    ExFreePoolWithTag(sandboxPathBuf, SANDBOX_POOL_TAG);
     if (!NT_SUCCESS(status)) {
-        FltReleaseContext(ctx);
-        return status;
+        goto Cleanup;
     }
 
+    // 4. Set the stream handle context
     // 将自定义数据结构与文件对象关联
     status = FltSetStreamHandleContext(FltObjects->Instance,
         FltObjects->FileObject,
         FLT_SET_CONTEXT_KEEP_IF_EXISTS,
         ctx,
         NULL);
+
+    // Handle race condition where another thread set it first
     // 多线程并发设置同一个 FileObject 上下文 
     if (status == STATUS_FLT_CONTEXT_ALREADY_DEFINED) {
+        // Close handles opened for the local duplicate context
+        FltClose(ctx->SandboxHandle);
+        ObDereferenceObject(ctx->SandboxFileObject);
+
+        // Release our allocation reference
         FltReleaseContext(ctx);
-        rawCtx = NULL;
+        ctx = NULL;
+
+        // Retrieve the existing context (adds 1 to ref count)
         status = FltGetStreamHandleContext(FltObjects->Instance,
             FltObjects->FileObject,
             &rawCtx);
-        if (NT_SUCCESS(status))
+        if (NT_SUCCESS(status)) {
             *OutCtx = (PDIR_MERGE_CONTEXT)rawCtx;
-        return status;
-    }
-    if (!NT_SUCCESS(status)) {
-        FltReleaseContext(ctx);
-        return status;
+        }
+        goto Cleanup;
     }
 
+    if (!NT_SUCCESS(status)) {
+        // If setting context failed for any other reason, clean up the handles
+        FltClose(ctx->SandboxHandle);
+        ObDereferenceObject(ctx->SandboxFileObject);
+        goto Cleanup;
+    }
+
+    // Success path for newly created context
     *OutCtx = ctx;
-    return STATUS_SUCCESS;
+    status = STATUS_SUCCESS;
+
+Cleanup:
+    // Always free the allocated path buffer
+    if (pathAllocated) {
+        ExFreePoolWithTag(sandboxPath.Buffer, SANDBOX_POOL_TAG);
+    }
+
+    // If we encountered an error and ctx was allocated but not set, release it
+    if (!NT_SUCCESS(status) && ctx != NULL) {
+        FltReleaseContext(ctx);
+    }
+
+    return status;
 }
 
 FLT_POSTOP_CALLBACK_STATUS
