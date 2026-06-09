@@ -7,5 +7,5 @@ x64/
 out/
 *.log
 tmp/
-
+*.user
 
