@@ -999,6 +999,7 @@ SandboxFlt_PreDirectoryControl(
     /*
      * Directory query buffers are commonly user buffers.  Lock them in pre-op
      * so post-op can safely replace STATUS_NO_MORE_FILES with sandbox entries.
+    FltLockUserBuffer is used to lock the user application's memory buffer into physical memory (RAM) and create a safe mapping for the kernel to access.
      */
     status = FltLockUserBuffer(Data);
     if (!NT_SUCCESS(status))
@@ -1020,6 +1021,22 @@ DirQuery_GetSystemBuffer(_In_ PFLT_CALLBACK_DATA Data)
     return Data->Iopb->Parameters.DirectoryControl.QueryDirectory.DirectoryBuffer;
 }
 
+// FltObjects Standard mini-filter callback object containing Instance, FileObject, Volume
+/*
+Path_BuildRedirect()
+        ↓
+   sandboxPath (UNICODE_STRING)
+        ↓
+   InitializeObjectAttributes()
+        ↓
+   FltCreateFileEx() 
+        ↓
+   ctx->SandboxFileObject  +  ctx->SandboxHandle
+        ↓
+   FltSetStreamHandleContext()  → attached to original FileObject
+        ↓
+   Cleanup: ExFreePoolWithTag(sandboxPath.Buffer)
+*/
 NTSTATUS
 DirMerge_OpenSandboxDirectory(
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -1097,9 +1114,13 @@ DirMerge_OpenSandboxDirectory(
     }
 
     // 4. Set the stream handle context
+    // PDIR_MERGE_CONTEXT (ctx) stores persistent information:
+    //      HANDLE         SandboxHandle;      // Handle to sandbox directory
+    //		PFILE_OBJECT   SandboxFileObject;  // FileObject of sandbox directory
+    // Only the opened handles are kept — not the path string.
     // 将自定义数据结构与文件对象关联
     status = FltSetStreamHandleContext(FltObjects->Instance,
-        FltObjects->FileObject,
+        FltObjects->FileObject,   // original directory
         FLT_SET_CONTEXT_KEEP_IF_EXISTS,
         ctx,
         NULL);
@@ -1167,6 +1188,20 @@ SandboxFlt_PostDirectoryControl(
     BOOLEAN returnSingleEntry;
     NTSTATUS status;
 
+	// todo, completioncontext need clean or not? if the context is stored in stream handle context, it will be automatically released by the framework when the handle is closed,
+    // so we don't need to manually free it here. However, if we allocated any additional resources in the context that are not automatically managed by the framework,
+    // we would need to ensure they are properly cleaned up in the context cleanup callback (SandboxFlt_DirMergeContextCleanup in this case). Since we're using FltAllocateContext and FltSetStreamHandleContext,
+    // the framework will take care of releasing the context when it's no longer needed, so we don't have to worry about manual cleanup in this post-op callback.
+    //if (BooleanFlagOn(Flags, FLTFL_POST_OPERATION_DRAINING)) {
+    //    // 2. Safely clean up any context passed from Pre-Op
+    //    if (CompletionContext != NULL) {
+    //        // Assuming CompletionContext was allocated via ExAllocatePool / FltAllocatePool
+    //        ExFreePoolWithTag(CompletionContext, MY_POOL_TAG);
+    //    }
+    //    // 3. Must return finished processing immediately
+    //    return FLT_POSTOP_FINISHED_PROCESSING;
+    //}
+
     if (FlagOn(Flags, FLTFL_POST_OPERATION_DRAINING))
         return FLT_POSTOP_FINISHED_PROCESSING;
 
@@ -1185,6 +1220,7 @@ SandboxFlt_PostDirectoryControl(
     if (!box)
         return FLT_POSTOP_FINISHED_PROCESSING;
 
+    // return a safe kernel-mode virtual address to the output buffer that will contain the directory listing results (FILE_DIRECTORY_INFORMATION, FILE_BOTH_DIR_INFORMATION, etc.).
     buffer = DirQuery_GetSystemBuffer(Data);
     length = Data->Iopb->Parameters.DirectoryControl.QueryDirectory.Length;
     if (!buffer || length == 0)
@@ -1198,6 +1234,8 @@ SandboxFlt_PostDirectoryControl(
     if (NT_SUCCESS(status))
         ctx = (PDIR_MERGE_CONTEXT)rawCtx;
     if (!NT_SUCCESS(status)) {
+        // opens a handle (SandboxHandle) and a FileObject (SandboxFileObject) to the sandbox directory.
+        // after FltCreateFileEx in this fun, ctx->SandboxHandle and ctx->SandboxFileObject now represent the opened sandbox directory.
         status = DirMerge_OpenSandboxDirectory(FltObjects, box, &ctx);
     }
     if (!NT_SUCCESS(status) || !ctx)
@@ -1215,7 +1253,7 @@ SandboxFlt_PostDirectoryControl(
 
     bytesReturned = 0;
     status = FltQueryDirectoryFile(FltObjects->Instance,
-        ctx->SandboxFileObject,
+        ctx->SandboxFileObject,  // ← Uses the opened sandbox FileObject(in DirMerge_OpenSandboxDirectory)
         buffer,
         length,
         Data->Iopb->Parameters.DirectoryControl.QueryDirectory.FileInformationClass,
