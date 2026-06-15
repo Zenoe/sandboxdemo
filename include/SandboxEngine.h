@@ -30,7 +30,7 @@ struct SandboxConfig {
     std::wstring executablePath;
     std::wstring commandLine;
     std::wstring fsRootBase;
-    std::wstring borderDllPath;   // NEW: path to SandboxBorder.dll; empty = skip
+    std::wstring borderDllPath;   // path to injected shell broker; empty = skip
     bool restrictUI     = true;
     bool killOnClose    = true;
     bool inheritConsole = false;

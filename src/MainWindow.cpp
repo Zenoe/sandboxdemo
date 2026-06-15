@@ -378,7 +378,7 @@ MainWindow::MainWindow(QWidget* parent)
     m_explorer.startPipeServer(m_driver, m_engine,
                                m_fsRoot->text().toStdWString());
     appendLog("  [Explorer] Named-pipe broker started.");
-    appendLog("  [Explorer] Place SandboxBorder.dll next to this EXE for yellow border.");
+    appendLog("  [Explorer] Place SandboxBorder.dll next to this EXE for Show in folder support.");
 }
 
 MainWindow::~MainWindow()
@@ -818,7 +818,7 @@ void MainWindow::onLaunchSandboxed()
         }
     }
 
-    // ── Inject SandboxBorder.dll BEFORE resume (context hijack).
+    // ── Inject the Show-in-folder shell broker BEFORE resume.
     // sp.suspended is still true here — resume() has not been called yet.
     // Must happen at this exact point: after addProcess() (so the driver
     // knows the PID) but before ResumeThread (so Job UI restrictions are
@@ -828,10 +828,10 @@ void MainWindow::onLaunchSandboxed()
         if (!dllPath.empty()) {
             bool ok = m_engine.injectWhileSuspended(sp, dllPath);
             appendLog(ok
-                ? QString("  [Border] Context hijack installed for PID %1").arg(sp.pid)
-                : QString("  [!] Context hijack failed for PID %1 — yellow border skipped").arg(sp.pid));
+                ? QString("  [Broker] Shell hook installed for PID %1").arg(sp.pid)
+                : QString("  [!] Shell broker injection failed for PID %1").arg(sp.pid));
         } else {
-            appendLog("  [!] SandboxBorder.dll not found — yellow border skipped.");
+            appendLog("  [!] SandboxBorder.dll not found — Show in folder broker unavailable.");
             appendLog("      Build SandboxBorder.dll and place it next to this EXE.");
         }
     }

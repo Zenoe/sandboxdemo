@@ -8,13 +8,13 @@ set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
 
-# ---- SandboxBorder.dll (injected payload, no Qt) ----
+# ---- SandboxBorder.dll (injected Show-in-folder broker, no Qt) ----
 add_library(SandboxBorder SHARED
     SandboxBorder/SandboxBorder.cpp
     SandboxBorder/SandboxBorder.h
 )
 target_compile_definitions(SandboxBorder PRIVATE SANDBOXBORDER_EXPORTS)
-target_link_libraries(SandboxBorder PRIVATE user32 shell32 shlwapi)
+target_link_libraries(SandboxBorder PRIVATE shell32)
 
 #set_target_properties(SandboxBorder PROPERTIES
 #    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}

@@ -20,19 +20,15 @@
 //    4. The sandboxed Explorer is in the same box → the minifilter
 //       redirects its file I/O, so it sees the merged view
 //       (host files + sandbox overlay = Notepad save-dialog style).
-//    5. SbieDll also hooks WM_NCPAINT in every sandboxed window
-//       to draw the yellow border, and prefixes window titles.
-//
 //  OUR IMPLEMENTATION:
-//    - SandboxBorder.dll  = the injected payload (hooks + border)
+//    - SandboxBorder.dll  = injected Show-in-folder shell hook
 //    - SandboxExplorer    = this class; runs a named-pipe server
 //      and handles open-folder requests from the DLL.
-//    - The DLL is injected via CreateRemoteThread → LoadLibrary
-//      after each sandboxed process is created (call InjectBorderDll).
+//    - The DLL is injected while each root process is suspended.
 //
 //  INTEGRATION POINTS in MainWindow.cpp:
 //    // After m_engine.launch() succeeds:
-//    m_explorer.injectBorderDll(sp, explorerDllPath);
+//    m_engine.injectWhileSuspended(sp, explorerDllPath);
 //    // Start pipe server once (e.g. in constructor):
 //    m_explorer.startPipeServer(m_driver, m_engine, cfg);
 // ============================================================

@@ -141,7 +141,7 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
 //  The Explorer instance is:
 //    - Assigned to the box's Job Object (via SandboxEngine::launch)
 //    - Its PID is registered with the driver (addProcess)
-//    - SandboxBorder.dll is injected into it for the yellow border
+//    - SandboxBorder.dll is injected for Show-in-folder interception
 //
 //  After injection, Explorer opens at the virtual path.  The
 //  PostDirectoryControl hook in SandboxFlt_Filter.c merges
@@ -207,18 +207,16 @@ bool SandboxExplorer::openFolderInSandbox(DriverManager&      driver,
         }
     }
 
-    // 6. Inject the border DLL BEFORE resume (context hijack, same fix as
-    //    the main Chrome injection path — avoids ERROR_ACCESS_DENIED=5 from
-    //    JOB_OBJECT_UILIMIT_HANDLES blocking CreateRemoteThread on live processes).
+    // 6. Inject the shell broker DLL before resume.
     {
         std::wstring dllPath = defaultDllPath();
         if (!dllPath.empty()) {
             bool ok = engine.injectWhileSuspended(sp, dllPath);
             log(ok
-                ? L"[Explorer] Context hijack installed for Explorer PID " + std::to_wstring(sp.pid)
-                : L"[Explorer] Context hijack failed — yellow border unavailable for Explorer");
+                ? L"[Explorer] Shell broker installed for Explorer PID " + std::to_wstring(sp.pid)
+                : L"[Explorer] Shell broker injection failed for Explorer");
         } else {
-            log(L"[Explorer] SandboxBorder.dll not found — yellow border unavailable.");
+            log(L"[Explorer] SandboxBorder.dll not found — Show in folder broker unavailable.");
         }
     }
 

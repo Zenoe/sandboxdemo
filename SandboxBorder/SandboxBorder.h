@@ -1,22 +1,13 @@
 ﻿#pragma once
 // ============================================================
-//  SandboxBorder.h  —  Shared definitions for the border DLL
+//  SandboxBorder.h  —  Shared definitions for the injected shell broker
 //
 //  This header is included by:
 //    - SandboxBorder.dll  (the injected payload)
 //    - SandboxExplorer.cpp (the launcher that injects it)
 //
-//  The DLL is injected into every sandboxed process via
-//  CreateRemoteThread → LoadLibrary.  Once loaded it:
-//
-//   1. Installs a WH_CALLWNDPROC hook on the target thread(s)
-//      to intercept WM_NCPAINT and WM_NCACTIVATE so it can
-//      draw the yellow border around each top-level window.
-//
-//   2. Installs a WH_CBT hook to catch newly created windows
-//      and prefix their title with [Sandbox: <boxName>].
-//
-//   3. Watches for SHOpenFolderAndSelectItems / ShellExecute
+//  The DLL is injected into sandboxed processes and watches for
+//  SHOpenFolderAndSelectItems / ShellExecute
 //      "open" verbs that Chrome fires for "Show in folder".
 //      When detected, it marshals the call to a helper that
 //      launches a NEW sandboxed Explorer pointing at the
@@ -38,18 +29,13 @@
 #define SANDBOX_BORDER_UNINIT_PROC "SandboxBorder_Uninit"
 
 // Environment variable the launcher sets in the child so the DLL
-// can read the box name and sandbox root without a pipe round-trip.
+// can identify the box without a pipe round-trip.
 #define SANDBOX_BORDER_BOX_ENV     L"SANDBOX_BOX"
-#define SANDBOX_BORDER_ROOT_ENV    L"SANDBOX_ROOT"
 
 // Single broker pipe shared by all boxes.
 // Box identity is carried in the JSON body, not the pipe name.
 // Must match kPipeName in SandboxExplorer.cpp.
 #define SANDBOX_PIPE_NAME          L"\\\\.\\pipe\\SandboxFlt_Broker"
-
-// Border appearance
-#define SANDBOX_BORDER_COLOR       RGB(255, 210, 0)   // Sandboxie yellow
-#define SANDBOX_BORDER_THICKNESS   4                  // pixels
 
 // Exported from the DLL
 #ifdef SANDBOXBORDER_EXPORTS
@@ -62,8 +48,8 @@
 extern "C" {
 #endif
 
-// Called once by the launcher via CreateRemoteThread after LoadLibrary.
-// boxName and sandboxRoot are read from env vars (already in the child).
+// Called once by the launcher's suspended-thread bootstrap after LoadLibrary.
+// The box name is read from an environment variable already in the child.
 SBAPI BOOL WINAPI SandboxBorder_Init(void);
 SBAPI BOOL WINAPI SandboxBorder_Uninit(void);
 
