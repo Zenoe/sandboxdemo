@@ -549,11 +549,24 @@ void MainWindow::setupUi()
         "border-radius:3px;padding:2px 6px;}"
         "QComboBox QAbstractItemView{background:#15151f;color:#ccc;}");
 
+    auto* hookLabel = makeLabel("Shell hook:");
+    m_cmbHookMode = new QComboBox;
+    m_cmbHookMode->addItem("Inline hook", "inline");
+    m_cmbHookMode->addItem("IAT patch", "iat");
+    m_cmbHookMode->setCurrentIndex(0);
+    m_cmbHookMode->setStyleSheet(
+        "QComboBox{background:#0e0e16;color:#d8d8e8;border:1px solid #2a2a3a;"
+        "border-radius:3px;padding:2px 6px;}"
+        "QComboBox QAbstractItemView{background:#15151f;color:#ccc;}");
+
     optRow->addWidget(m_chkRestrictUI);
     optRow->addWidget(m_chkKillOnClose);
     optRow->addSpacing(20);
     optRow->addWidget(policyLabel);
     optRow->addWidget(m_cmbPolicy);
+    optRow->addSpacing(20);
+    optRow->addWidget(hookLabel);
+    optRow->addWidget(m_cmbHookMode);
     optRow->addStretch();
     cfgGrid->addLayout(optRow, 4, 0, 1, 3);
 
@@ -806,6 +819,7 @@ void MainWindow::onLaunchSandboxed()
     cfg.executablePath = exe.toStdWString();
     cfg.commandLine    = m_extraArgs->text().toStdWString();
     cfg.fsRootBase     = fsRoot.toStdWString();
+    cfg.hookMode       = m_cmbHookMode->currentData().toString().toStdWString();
     cfg.restrictUI     = m_chkRestrictUI->isChecked() && !isChromium;
     cfg.killOnClose    = m_chkKillOnClose->isChecked();
     if (isChromium && m_chkRestrictUI->isChecked()) {

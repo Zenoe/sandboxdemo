@@ -14,10 +14,12 @@
 #include <shellapi.h>
 #include <string>
 #include <cstdio>
+#include <cstring>
 
 #pragma comment(lib, "Shell32.lib")
 
 static wchar_t g_BoxName[64] = {};
+static wchar_t g_HookMode[16] = SANDBOX_HOOK_MODE_INLINE;
 static constexpr wchar_t g_PipeName[] = SANDBOX_PIPE_NAME;
 
 using PFN_SHOpenFolderAndSelectItems = HRESULT(WINAPI*)(
@@ -27,6 +29,25 @@ using PFN_ShellExecuteW = HINSTANCE(WINAPI*)(
 
 static PFN_SHOpenFolderAndSelectItems g_origSHOpen = nullptr;
 static PFN_ShellExecuteW g_origShellExecuteW = nullptr;
+
+enum class HookMode {
+    Inline,
+    Iat
+};
+
+static HookMode g_ActiveHookMode = HookMode::Inline;
+static SRWLOCK g_InlineHookLock = SRWLOCK_INIT;
+
+struct InlineHook {
+    void* target = nullptr;
+    void* replacement = nullptr;
+    BYTE original[12] = {};
+    SIZE_T size = sizeof(original);
+    bool installed = false;
+};
+
+static InlineHook g_SHOpenInlineHook;
+static InlineHook g_ShellExecuteInlineHook;
 
 static void NotifyHostOpenFolder(const wchar_t* realPath)
 {
@@ -51,8 +72,10 @@ static void NotifyHostOpenFolder(const wchar_t* realPath)
         "{\"cmd\":\"openFolder\",\"box\":\"%s\",\"path\":\"%s\"}\n",
         boxUtf8, escapedPath.c_str());
 
-    DWORD written = 0;
-    WriteFile(hPipe, message, static_cast<DWORD>(length), &written, nullptr);
+    if (length > 0) {
+        DWORD written = 0;
+        WriteFile(hPipe, message, static_cast<DWORD>(length), &written, nullptr);
+    }
     CloseHandle(hPipe);
 }
 
@@ -109,6 +132,140 @@ static bool PatchIAT(HMODULE module, const char* dll, const char* function,
     return false;
 }
 
+static bool InstallInlineHook(InlineHook& hook, void* target, void* replacement)
+{
+#if defined(_M_X64) || defined(__x86_64__)
+    if (!target || !replacement)
+        return false;
+
+    hook.target = target;
+    hook.replacement = replacement;
+    std::memcpy(hook.original, target, hook.size);
+
+    BYTE patch[12] = {
+        0x48, 0xB8,                         // mov rax, imm64
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0xFF, 0xE0                          // jmp rax
+    };
+    *reinterpret_cast<UINT64*>(patch + 2) =
+        reinterpret_cast<UINT64>(replacement);
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(target, hook.size, PAGE_EXECUTE_READWRITE,
+        &oldProtection)) {
+        return false;
+    }
+
+    std::memcpy(target, patch, sizeof(patch));
+    FlushInstructionCache(GetCurrentProcess(), target, hook.size);
+    VirtualProtect(target, hook.size, oldProtection, &oldProtection);
+    hook.installed = true;
+    return true;
+#else
+    UNREFERENCED_PARAMETER(hook);
+    UNREFERENCED_PARAMETER(target);
+    UNREFERENCED_PARAMETER(replacement);
+    return false;
+#endif
+}
+
+static void RestoreInlineHook(InlineHook& hook)
+{
+    if (!hook.installed || !hook.target)
+        return;
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(hook.target, hook.size, PAGE_EXECUTE_READWRITE,
+        &oldProtection)) {
+        return;
+    }
+
+    std::memcpy(hook.target, hook.original, hook.size);
+    FlushInstructionCache(GetCurrentProcess(), hook.target, hook.size);
+    VirtualProtect(hook.target, hook.size, oldProtection, &oldProtection);
+    hook.installed = false;
+}
+
+static void ReinstallInlineHook(InlineHook& hook)
+{
+    if (!hook.target || !hook.replacement || hook.installed)
+        return;
+
+#if defined(_M_X64) || defined(__x86_64__)
+    BYTE patch[12] = {
+        0x48, 0xB8,
+        0, 0, 0, 0, 0, 0, 0, 0,
+        0xFF, 0xE0
+    };
+    *reinterpret_cast<UINT64*>(patch + 2) =
+        reinterpret_cast<UINT64>(hook.replacement);
+
+    DWORD oldProtection = 0;
+    if (!VirtualProtect(hook.target, hook.size, PAGE_EXECUTE_READWRITE,
+        &oldProtection)) {
+        return;
+    }
+
+    std::memcpy(hook.target, patch, sizeof(patch));
+    FlushInstructionCache(GetCurrentProcess(), hook.target, hook.size);
+    VirtualProtect(hook.target, hook.size, oldProtection, &oldProtection);
+    hook.installed = true;
+#endif
+}
+
+static HRESULT CallOriginalSHOpen(
+    PCIDLIST_ABSOLUTE pidl, UINT count,
+    PCUITEMID_CHILD_ARRAY children, DWORD flags)
+{
+    if (g_ActiveHookMode != HookMode::Inline) {
+        return g_origSHOpen
+            ? g_origSHOpen(pidl, count, children, flags)
+            : E_FAIL;
+    }
+
+    AcquireSRWLockExclusive(&g_InlineHookLock);
+    RestoreInlineHook(g_SHOpenInlineHook);
+    ReleaseSRWLockExclusive(&g_InlineHookLock);
+
+    auto original = reinterpret_cast<PFN_SHOpenFolderAndSelectItems>(
+        g_SHOpenInlineHook.target);
+    HRESULT result = original
+        ? original(pidl, count, children, flags)
+        : E_FAIL;
+
+    AcquireSRWLockExclusive(&g_InlineHookLock);
+    ReinstallInlineHook(g_SHOpenInlineHook);
+    ReleaseSRWLockExclusive(&g_InlineHookLock);
+    return result;
+}
+
+static HINSTANCE CallOriginalShellExecuteW(
+    HWND window, LPCWSTR operation, LPCWSTR file, LPCWSTR parameters,
+    LPCWSTR directory, INT showCommand)
+{
+    if (g_ActiveHookMode != HookMode::Inline) {
+        return g_origShellExecuteW
+            ? g_origShellExecuteW(window, operation, file, parameters,
+                directory, showCommand)
+            : reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(2));
+    }
+
+    AcquireSRWLockExclusive(&g_InlineHookLock);
+    RestoreInlineHook(g_ShellExecuteInlineHook);
+    ReleaseSRWLockExclusive(&g_InlineHookLock);
+
+    auto original = reinterpret_cast<PFN_ShellExecuteW>(
+        g_ShellExecuteInlineHook.target);
+    HINSTANCE result = original
+        ? original(window, operation, file, parameters, directory, showCommand)
+        : reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(2));
+
+    AcquireSRWLockExclusive(&g_InlineHookLock);
+    ReinstallInlineHook(g_ShellExecuteInlineHook);
+    ReleaseSRWLockExclusive(&g_InlineHookLock);
+    return result;
+}
+
 static HRESULT WINAPI Hook_SHOpenFolderAndSelectItems(
     PCIDLIST_ABSOLUTE pidl, UINT count,
     PCUITEMID_CHILD_ARRAY children, DWORD flags)
@@ -118,9 +275,7 @@ static HRESULT WINAPI Hook_SHOpenFolderAndSelectItems(
         NotifyHostOpenFolder(path);
         return S_OK;
     }
-    return g_origSHOpen
-        ? g_origSHOpen(pidl, count, children, flags)
-        : E_FAIL;
+    return CallOriginalSHOpen(pidl, count, children, flags);
 }
 
 static HINSTANCE WINAPI Hook_ShellExecuteW(
@@ -138,47 +293,76 @@ static HINSTANCE WINAPI Hook_ShellExecuteW(
         }
     }
 
-    return g_origShellExecuteW
-        ? g_origShellExecuteW(window, operation, file, parameters,
-            directory, showCommand)
-        : reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(2));
+    return CallOriginalShellExecuteW(window, operation, file, parameters,
+        directory, showCommand);
 }
 
 extern "C" SBAPI BOOL WINAPI SandboxBorder_Init(void)
 {
     GetEnvironmentVariableW(SANDBOX_BORDER_BOX_ENV,
         g_BoxName, ARRAYSIZE(g_BoxName));
+    GetEnvironmentVariableW(SANDBOX_HOOK_MODE_ENV,
+        g_HookMode, ARRAYSIZE(g_HookMode));
     if (g_BoxName[0] == L'\0')
         return FALSE;
 
     HMODULE executable = GetModuleHandleW(nullptr);
     HMODULE shell = GetModuleHandleW(L"shell32.dll");
-    PatchIAT(executable, "shell32.dll", "SHOpenFolderAndSelectItems",
-        reinterpret_cast<PROC>(Hook_SHOpenFolderAndSelectItems),
-        reinterpret_cast<PROC*>(&g_origSHOpen));
-    PatchIAT(executable, "shell32.dll", "ShellExecuteW",
-        reinterpret_cast<PROC>(Hook_ShellExecuteW),
-        reinterpret_cast<PROC*>(&g_origShellExecuteW));
 
-    if (!g_origSHOpen && shell) {
-        g_origSHOpen = reinterpret_cast<PFN_SHOpenFolderAndSelectItems>(
-            GetProcAddress(shell, "SHOpenFolderAndSelectItems"));
+    if (_wcsicmp(g_HookMode, SANDBOX_HOOK_MODE_IAT) == 0) {
+        g_ActiveHookMode = HookMode::Iat;
+        PatchIAT(executable, "shell32.dll", "SHOpenFolderAndSelectItems",
+            reinterpret_cast<PROC>(Hook_SHOpenFolderAndSelectItems),
+            reinterpret_cast<PROC*>(&g_origSHOpen));
+        PatchIAT(executable, "shell32.dll", "ShellExecuteW",
+            reinterpret_cast<PROC>(Hook_ShellExecuteW),
+            reinterpret_cast<PROC*>(&g_origShellExecuteW));
+
+        if (!g_origSHOpen && shell) {
+            g_origSHOpen = reinterpret_cast<PFN_SHOpenFolderAndSelectItems>(
+                GetProcAddress(shell, "SHOpenFolderAndSelectItems"));
+        }
+        if (!g_origShellExecuteW && shell) {
+            g_origShellExecuteW = reinterpret_cast<PFN_ShellExecuteW>(
+                GetProcAddress(shell, "ShellExecuteW"));
+        }
     }
-    if (!g_origShellExecuteW && shell) {
-        g_origShellExecuteW = reinterpret_cast<PFN_ShellExecuteW>(
+    else {
+        g_ActiveHookMode = HookMode::Inline;
+        if (!shell)
+            return FALSE;
+
+        void* shOpen = reinterpret_cast<void*>(
+            GetProcAddress(shell, "SHOpenFolderAndSelectItems"));
+        void* shellExecute = reinterpret_cast<void*>(
             GetProcAddress(shell, "ShellExecuteW"));
+
+        bool shOpenOk = InstallInlineHook(g_SHOpenInlineHook, shOpen,
+            reinterpret_cast<void*>(Hook_SHOpenFolderAndSelectItems));
+        bool shellExecuteOk = InstallInlineHook(g_ShellExecuteInlineHook,
+            shellExecute, reinterpret_cast<void*>(Hook_ShellExecuteW));
+        if (!shOpenOk && !shellExecuteOk)
+            return FALSE;
     }
     return TRUE;
 }
 
 extern "C" SBAPI BOOL WINAPI SandboxBorder_Uninit(void)
 {
+    AcquireSRWLockExclusive(&g_InlineHookLock);
+    RestoreInlineHook(g_SHOpenInlineHook);
+    RestoreInlineHook(g_ShellExecuteInlineHook);
+    ReleaseSRWLockExclusive(&g_InlineHookLock);
     return TRUE;
 }
 
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID)
+BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
 {
-    if (reason == DLL_PROCESS_ATTACH)
+    if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(instance);
+    }
+    else if (reason == DLL_PROCESS_DETACH && reserved == nullptr) {
+        SandboxBorder_Uninit();
+    }
     return TRUE;
 }

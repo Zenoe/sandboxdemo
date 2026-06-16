@@ -454,6 +454,7 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
                 // Never inherit stale sandbox identity into a new launch.
                 if (entry.find(L"SANDBOX_ROOT=") != 0 &&
                     entry.find(L"SANDBOX_BOX=") != 0 &&
+                    entry.find(L"SANDBOX_HOOK_MODE=") != 0 &&
                     entry.find(L"SANDBOX_BORDER_ACTIVE=") != 0)
                     envBlock += entry + L'\0';
                 p += entry.size() + 1;
@@ -463,6 +464,8 @@ bool SandboxEngine::spawnInJob(const SandboxConfig& cfg,
         // Inject sandbox variables
         envBlock += L"SANDBOX_ROOT=" + out.fsRoot + L'\0';
         envBlock += L"SANDBOX_BOX=" + cfg.boxName + L'\0';
+        envBlock += L"SANDBOX_HOOK_MODE=" +
+            (cfg.hookMode.empty() ? L"inline" : cfg.hookMode) + L'\0';
         if (!cfg.borderDllPath.empty())
             envBlock += L"SANDBOX_BORDER_ACTIVE=1\0";
         envBlock += L'\0';  // double-null terminator

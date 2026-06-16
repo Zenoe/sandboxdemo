@@ -79,6 +79,7 @@ private:
     QCheckBox*   m_chkRestrictUI = nullptr;
     QCheckBox*   m_chkKillOnClose= nullptr;
     QComboBox*   m_cmbPolicy     = nullptr;
+    QComboBox*   m_cmbHookMode   = nullptr;
     QPushButton* m_btnBrowse     = nullptr;
     QPushButton* m_btnNormal     = nullptr;
     QPushButton* m_btnSandboxed  = nullptr;

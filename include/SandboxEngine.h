@@ -31,6 +31,7 @@ struct SandboxConfig {
     std::wstring commandLine;
     std::wstring fsRootBase;
     std::wstring borderDllPath;   // path to injected shell broker; empty = skip
+    std::wstring hookMode = L"inline";
     bool restrictUI     = true;
     bool killOnClose    = true;
     bool inheritConsole = false;

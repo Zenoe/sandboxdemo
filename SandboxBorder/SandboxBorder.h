@@ -31,6 +31,12 @@
 // Environment variable the launcher sets in the child so the DLL
 // can identify the box without a pipe round-trip.
 #define SANDBOX_BORDER_BOX_ENV     L"SANDBOX_BOX"
+#define SANDBOX_HOOK_MODE_ENV      L"SANDBOX_HOOK_MODE"
+
+// Supported hook modes. Inline is the default because it also catches direct
+// calls to shell32 exports, not only calls through the main EXE's IAT.
+#define SANDBOX_HOOK_MODE_INLINE   L"inline"
+#define SANDBOX_HOOK_MODE_IAT      L"iat"
 
 // Single broker pipe shared by all boxes.
 // Box identity is carried in the JSON body, not the pipe name.
