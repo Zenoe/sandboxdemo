@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 //  SandboxExplorer.cpp
 // ============================================================
 #include "SandboxExplorer.h"
@@ -69,6 +69,8 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
                                       SandboxEngine*  engine,
                                       std::wstring    fsRootBase)
 {
+    log(L"[Explorer] Pipe worker entered. fsRoot=" + fsRootBase);
+
     while (m_running.load()) {
         // Create a new named pipe instance for each connection
         HANDLE hPipe = CreateNamedPipeW(
@@ -85,12 +87,20 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
             continue;
         }
 
+        log(L"[Explorer] Pipe instance ready; waiting for client...");
+
         // Block until a client connects
         BOOL connected = ConnectNamedPipe(hPipe, nullptr);
-        if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+        DWORD connectError = connected ? ERROR_SUCCESS : GetLastError();
+        if (!connected && connectError != ERROR_PIPE_CONNECTED) {
+            log(L"[Explorer] ConnectNamedPipe failed: " +
+                std::to_wstring(connectError));
             CloseHandle(hPipe);
             continue;
         }
+
+        log(L"[Explorer] Pipe client connected.");
+
         if (!m_running.load()) {
             DisconnectNamedPipe(hPipe);
             CloseHandle(hPipe);
@@ -100,9 +110,12 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
         // Read one message (up to 4 KB)
         char buf[4096] = {};
         DWORD read = 0;
-        if (ReadFile(hPipe, buf, sizeof(buf) - 1, &read, nullptr) && read > 0) {
+        BOOL readOk = ReadFile(hPipe, buf, sizeof(buf) - 1, &read, nullptr);
+        if (readOk && read > 0) {
             buf[read] = '\0';
             std::string json(buf);
+            log(L"[Explorer] Pipe message received: " +
+                std::to_wstring(read) + L" bytes.");
 
             // Parse: {"cmd":"openFolder","box":"Box00","path":"C:\\..."}
             std::string cmd  = jsonGetField(json, "cmd");
@@ -119,11 +132,25 @@ void SandboxExplorer::pipeServerLoop(DriverManager* driver,
 
                 openFolderInSandbox(*driver, *engine, wBox, wPath, fsRootBase);
             }
+            else {
+                log(L"[Explorer] Ignored malformed/unknown pipe message: cmd=" +
+                    StringUtil::utf8ToWide(cmd) + L" box=" +
+                    StringUtil::utf8ToWide(box) + L" path=" +
+                    StringUtil::utf8ToWide(path));
+            }
+        }
+        else {
+            DWORD readError = readOk ? ERROR_SUCCESS : GetLastError();
+            log(L"[Explorer] Pipe read returned no message. bytes=" +
+                std::to_wstring(read) + L" error=" +
+                std::to_wstring(readError));
         }
 
         DisconnectNamedPipe(hPipe);
         CloseHandle(hPipe);
     }
+
+    log(L"[Explorer] Pipe worker exited.");
 }
 
 // ============================================================

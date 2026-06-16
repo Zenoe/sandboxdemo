@@ -1,4 +1,4 @@
-﻿// ============================================================
+// ============================================================
 //  MainWindow.cpp  —  Full Qt6 GUI with driver panel
 //
 //  Changes vs original:
@@ -24,6 +24,7 @@
 #include <QDir>
 #include <QHeaderView>
 #include <QTreeWidgetItemIterator>
+#include <QMetaObject>
 #include <algorithm>
 #include <functional>
 #include <unordered_map>
@@ -331,9 +332,26 @@ static void PrefixHostWindowTitle(HWND hwnd, const std::wstring& boxName)
 // ============================================================
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
-    , m_engine(  [this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
-    , m_driver(  [this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); })
-    , m_explorer([this](const std::wstring& m){ appendLog(QString::fromStdWString(m)); }) // ← NEW
+    // 
+     //, m_engine([this](const std::wstring& m) { appendLog(QString::fromStdWString(m)); })
+     //, m_driver([this](const std::wstring& m) { appendLog(QString::fromStdWString(m)); })
+     //, m_explorer([this](const std::wstring& m) { appendLog(QString::fromStdWString(m)); })
+
+    , m_engine([this](const std::wstring& m) {
+        const QString text = QString::fromStdWString(m);
+        QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
+            Qt::QueuedConnection);
+    })
+    , m_driver([this](const std::wstring& m) {
+        const QString text = QString::fromStdWString(m);
+        QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
+            Qt::QueuedConnection);
+    })
+    , m_explorer([this](const std::wstring& m) {
+        const QString text = QString::fromStdWString(m);
+        QMetaObject::invokeMethod(this, [this, text] { appendLog(text); },
+            Qt::QueuedConnection);
+    })
     , m_monitor(new ProcessMonitor(this))
     , m_statsTimer(new QTimer(this))
     , m_borderTimer(new QTimer(this))
